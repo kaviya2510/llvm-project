@@ -1291,6 +1291,13 @@ public:
         : DepKind(DepKind), DepValueType(DepValueType), DepVal(DepVal) {}
   };
 
+  InsertPointOrErrorTy createTaskloop(
+      const LocationDescription &Loc, InsertPointTy AllocaIP,
+      BodyGenCallbackTy BodyGenCB,
+      llvm::function_ref<llvm::Expected<llvm::CanonicalLoopInfo *>()> loopInfo,
+      Value *LBVal, Value *UBVal, Value *StepVal, bool Tied = true,
+      Value *IfCondition = nullptr);
+
   /// Generator for `#omp task`
   ///
   /// \param Loc The location where the task construct was encountered.
