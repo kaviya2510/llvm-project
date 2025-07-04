@@ -1898,6 +1898,258 @@ static Value *emitTaskDependencies(
   return DepArray;
 }
 
+OpenMPIRBuilder::InsertPointOrErrorTy OpenMPIRBuilder::createTaskloop(
+    const LocationDescription &Loc, InsertPointTy AllocaIP,
+    BodyGenCallbackTy BodyGenCB, LoopBodyGenCallbackTy LoopGenCB,
+    llvm::function_ref<llvm::Expected<llvm::CanonicalLoopInfo *>()> loopInfo,
+    Value *LBVal, Value *UBVal, Value *StepVal, bool Tied, Value *IfCondition) {
+
+  if (!updateToLocation(Loc))
+    return InsertPointTy();
+
+  uint32_t SrcLocStrSize;
+  Constant *SrcLocStr = getOrCreateSrcLocStr(Loc, SrcLocStrSize);
+  Value *Ident = getOrCreateIdent(SrcLocStr, SrcLocStrSize);
+
+  BasicBlock *TaskloopExitBB =
+      splitBB(Builder, /*CreateBranch=*/true, "taskloop.exit");
+  BasicBlock *TaskloopBodyBB =
+      splitBB(Builder, /*CreateBranch=*/true, "taskloop.body");
+  BasicBlock *TaskloopAllocaBB =
+      splitBB(Builder, /*CreateBranch=*/true, "taskloop.alloca");
+
+  InsertPointTy TaskloopAllocaIP =
+      InsertPointTy(TaskloopAllocaBB, TaskloopAllocaBB->begin());
+  InsertPointTy TaskloopBodyIP =
+      InsertPointTy(TaskloopBodyBB, TaskloopBodyBB->begin());
+  if (Error Err = BodyGenCB(TaskloopAllocaIP, TaskloopBodyIP))
+    return Err;
+
+  // llvm::Expected<llvm::CanonicalLoopInfo *> result = loopInfo();
+  // if (!result) {
+  //   llvm::errs() << "Error getting loop info: "
+  //                << llvm::toString(result.takeError()) << "\n";
+  // }
+
+  // llvm::CanonicalLoopInfo *CLI = result.get();
+  OutlineInfo OI;
+  OI.EntryBB = TaskloopAllocaBB;
+  OI.OuterAllocaBB = AllocaIP.getBlock();
+  OI.ExitBB = TaskloopExitBB;
+
+  // Add the thread ID argument.
+  SmallVector<Instruction *, 4> ToBeDeleted;
+  // dummy instruction to be used as a fake argument
+  OI.ExcludeArgsFromAggregate.push_back(createFakeIntVal(
+      Builder, AllocaIP, ToBeDeleted, TaskloopAllocaIP, "global.tid", false));
+
+  OI.PostOutlineCB = [this, Ident, LBVal, UBVal, StepVal, Tied, IfCondition,
+                      TaskloopAllocaBB, AllocaIP, LoopGenCB, Loc,
+                      TaskloopAllocaIP,
+                      ToBeDeleted](Function &OutlinedFn) mutable {
+    // Replace the Stale CI by appropriate RTL function call.
+    assert(OutlinedFn.hasOneUse() &&
+           "there must be a single user for the outlined function");
+    CallInst *StaleCI = cast<CallInst>(OutlinedFn.user_back());
+
+    // HasShareds is true if any variables are captured in the outlined region,
+    // false otherwise.
+    bool HasShareds = StaleCI->arg_size() > 1;
+    Builder.SetInsertPoint(StaleCI);
+
+    // Gather the arguments for emitting the runtime call for
+    // @__kmpc_omp_task_alloc
+    Function *TaskAllocFn =
+        getOrCreateRuntimeFunctionPtr(OMPRTL___kmpc_omp_task_alloc);
+
+    // Arguments - `loc_ref` (Ident) and `gtid` (ThreadID)
+    // call.
+    Value *ThreadID = getOrCreateThreadID(Ident);
+
+    Function *TaskgroupFn =
+        getOrCreateRuntimeFunctionPtr(OMPRTL___kmpc_taskgroup);
+    Builder.CreateCall(TaskgroupFn, {Ident, ThreadID});
+
+    // The flags are set to 1 if the task is tied, 0 otherwise.
+    Value *Flags = Builder.getInt32(Tied); // have to look at it
+
+    Value *TaskSize = Builder.getInt64(
+        divideCeil(M.getDataLayout().getTypeSizeInBits(Taskloop), 8));
+
+    Value *SharedsSize = Builder.getInt64(0);
+    if (HasShareds) {
+      AllocaInst *ArgStructAlloca =
+          dyn_cast<AllocaInst>(StaleCI->getArgOperand(1));
+      assert(ArgStructAlloca &&
+             "Unable to find the alloca instruction corresponding to arguments "
+             "for extracted function");
+      StructType *ArgStructType =
+          dyn_cast<StructType>(ArgStructAlloca->getAllocatedType());
+      assert(ArgStructType && "Unable to find struct type corresponding to "
+                              "arguments for extracted function");
+      SharedsSize =
+          Builder.getInt64(M.getDataLayout().getTypeStoreSize(ArgStructType));
+    }
+
+    // Emit the @__kmpc_omp_task_alloc runtime call
+    // The runtime call returns a pointer to an area where the task captured
+    // variables must be copied before the task is run (TaskData)
+    CallInst *TaskData = Builder.CreateCall(
+        TaskAllocFn, {/*loc_ref=*/Ident, /*gtid=*/ThreadID, /*flags=*/Flags,
+                      /*sizeof_task=*/TaskSize, /*sizeof_shared=*/SharedsSize,
+                      /*task_func=*/&OutlinedFn});
+
+    // set up the lowerBound,upperbound and step values
+    // The taskloop runtime function expects these values to be of type
+    // kmp_uint64, so we need to convert them to that type.
+    llvm::Value *lb =
+        Builder.CreateStructGEP(OpenMPIRBuilder::Taskloop, TaskData, 5);
+    Value *LbVal_ext = Builder.CreateSExt(LBVal, Builder.getInt64Ty());
+    Builder.CreateStore(LbVal_ext, lb);
+
+    llvm::Value *ub =
+        Builder.CreateStructGEP(OpenMPIRBuilder::Taskloop, TaskData, 6);
+    Value *UbVal_ext = Builder.CreateSExt(UBVal, Builder.getInt64Ty());
+    Builder.CreateStore(UbVal_ext, ub);
+
+    llvm::Value *step =
+        Builder.CreateStructGEP(OpenMPIRBuilder::Taskloop, TaskData, 7);
+    Value *Step_ext = Builder.CreateSExt(StepVal, Builder.getInt64Ty());
+    Builder.CreateStore(Step_ext, step);
+    llvm::Value *loadstep = Builder.CreateLoad(Builder.getInt64Ty(), step);
+
+    if (HasShareds) {
+      Value *Shareds = StaleCI->getArgOperand(1);
+      Align Alignment = TaskData->getPointerAlignment(M.getDataLayout());
+      Value *TaskShareds = Builder.CreateLoad(VoidPtr, TaskData);
+      Builder.CreateMemCpy(TaskShareds, Alignment, Shareds, Alignment,
+                           SharedsSize);
+    }
+
+    // setting default values for ifval, nogroup, sched, grainsize, task_dup
+    // These values are used in the taskloop runtime call.
+    Value *IfVal = Builder.getInt32(1);
+    Value *NoGroup = Builder.getInt32(1);
+    Value *Sched = Builder.getInt32(0);
+    Value *GrainSize = Builder.getInt64(0);
+    Value *TaskDup = Constant::getNullValue(Builder.getPtrTy());
+
+    Value *Args[] = {Ident,    ThreadID, TaskData, IfVal,     lb,     ub,
+                     loadstep, NoGroup,  Sched,    GrainSize, TaskDup};
+
+    // taskloop runtime call
+    Function *TaskloopFn =
+        getOrCreateRuntimeFunctionPtr(OMPRTL___kmpc_taskloop);
+    Builder.CreateCall(TaskloopFn, Args);
+
+    // Emit the @__kmpc_end_taskgroup runtime call to end the taskgroup
+    Function *EndTaskgroupFn =
+        getOrCreateRuntimeFunctionPtr(OMPRTL___kmpc_end_taskgroup);
+    Builder.CreateCall(EndTaskgroupFn, {Ident, ThreadID});
+
+    StaleCI->eraseFromParent();
+
+    Builder.SetInsertPoint(TaskloopAllocaBB, TaskloopAllocaBB->begin());
+
+    if (HasShareds) {
+      LoadInst *Shareds = Builder.CreateLoad(VoidPtr, OutlinedFn.getArg(1));
+      OutlinedFn.getArg(1)->replaceUsesWithIf(
+          Shareds, [Shareds](Use &U) { return U.getUser() != Shareds; });
+
+      Value *lower_staleCI = Builder.CreateStructGEP(OpenMPIRBuilder::Taskloop,
+                                                     OutlinedFn.getArg(1), 5);
+      Value *load_lower_staleCI =
+          Builder.CreateLoad(Builder.getInt64Ty(), lower_staleCI);
+
+      // Truncate the loaded value to int32
+      Value *trunc_lower_staleCI =
+          Builder.CreateTrunc(load_lower_staleCI, Builder.getInt32Ty());
+
+      Value *upper_staleCI = Builder.CreateStructGEP(OpenMPIRBuilder::Taskloop,
+                                                     OutlinedFn.getArg(1), 6);
+      Value *load_upper_staleCI =
+          Builder.CreateLoad(Builder.getInt64Ty(), upper_staleCI);
+      Value *trunc_upper_staleCI =
+          Builder.CreateTrunc(load_upper_staleCI, Builder.getInt32Ty());
+
+      Value *step_staleCI = Builder.CreateStructGEP(OpenMPIRBuilder::Taskloop,
+                                                    OutlinedFn.getArg(1), 7);
+      Value *load_step_staleCI =
+          Builder.CreateLoad(Builder.getInt64Ty(), step_staleCI);
+      Value *trunc_step_staleCI =
+          Builder.CreateTrunc(load_step_staleCI, Builder.getInt32Ty());
+
+      llvm::Expected<CanonicalLoopInfo *> LoopInfo = createCanonicalLoop(
+          Loc, LoopGenCB, trunc_lower_staleCI, trunc_upper_staleCI,
+          trunc_step_staleCI, true, false, TaskloopAllocaIP);
+
+      //   // modify the loopBound based on the values from runtime
+      //   llvm::PHINode *PHI = llvm::cast<llvm::PHINode>(CLI->getIndVar());
+      //   PHI->setIncomingValueForBlock(CLI->getPreheader(),
+      //   trunc_lower_staleCI);
+
+      //   // update upperBound
+      //   llvm::BasicBlock *Cond = CLI->getCond();
+      //   for (llvm::Instruction &I : *Cond) {
+      //     if (auto *Cmp = llvm::dyn_cast<llvm::CmpInst>(&I)) {
+      //       if (Cmp->getOperand(0) == CLI->getIndVar()) {
+      //         // Update the predicate from ult to ule
+      //         if (Cmp->getPredicate() == llvm::ICmpInst::ICMP_ULT)
+      //           Cmp->setPredicate(llvm::ICmpInst::ICMP_ULE);
+
+      //         // Update the upper bound operand
+      //         Cmp->setOperand(1, trunc_upper_staleCI);
+      //         break;
+      //       }
+      //     }
+      //   }
+
+      //   // Update lowerBound
+      //   llvm::BasicBlock *Latch = CLI->getLatch();
+      //   for (llvm::Instruction &I : *Latch) {
+      //     if (auto *BinOp = llvm::dyn_cast<llvm::BinaryOperator>(&I)) {
+      //       if (BinOp->getOpcode() == llvm::Instruction::Add &&
+      //           BinOp->getOperand(0) == CLI->getIndVar()) {
+      //         BinOp->setOperand(1,
+      //                           trunc_step_staleCI); // update %step to new
+      //                           value
+      //         break;
+      //       }
+      //     }
+      //   }
+
+      //   // Update the loop body
+      //   llvm::BasicBlock *Body = CLI->getBody();
+      //   for (llvm::Instruction &I : *Body) {
+      //     if (auto *Mul = llvm::dyn_cast<llvm::BinaryOperator>(&I)) {
+      //       if (Mul->getOpcode() == llvm::Instruction::Mul &&
+      //           Mul->getOperand(0) == CLI->getIndVar()) {
+      //         Mul->setOperand(
+      //             1, llvm::ConstantInt::get(CLI->getIndVar()->getType(), 1));
+      //       }
+      //     }
+
+      //     if (auto *Add = llvm::dyn_cast<llvm::BinaryOperator>(&I)) {
+      //       if (Add->getOpcode() == llvm::Instruction::Add) {
+      //         if (llvm::isa<llvm::BinaryOperator>(Add->getOperand(0))) {
+      //           Add->setOperand(1, llvm::ConstantInt::get(Add->getType(),
+      //           0));
+      //         }
+      //       }
+      //     }
+      // }
+    }
+
+    for (Instruction *I : llvm::reverse(ToBeDeleted)) {
+      I->eraseFromParent();
+    }
+  };
+
+  addOutlineInfo(std::move(OI));
+  Builder.SetInsertPoint(TaskloopExitBB, TaskloopExitBB->begin());
+  return Builder.saveIP();
+}
+
 OpenMPIRBuilder::InsertPointOrErrorTy OpenMPIRBuilder::createTask(
     const LocationDescription &Loc, InsertPointTy AllocaIP,
     BodyGenCallbackTy BodyGenCB, bool Tied, Value *Final, Value *IfCondition,
