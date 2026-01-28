@@ -3,7 +3,7 @@ applyTo: flang/lib/Parser/openmp*,flang/lib/Semantics/*omp*,flang/lib/Lower/Open
 ---
 
 Status
-- PRs included: 6
+- PRs included: 7
 - Last modified: 2026-01-28
 
 # OpenMP Features (Version 1 maintained to reduce the conflict with newer versions)
@@ -1077,5 +1077,87 @@ How To Avoid Pitfalls
 - Always run `appendCombiner` in declare-reduction lowering so both explicit and implicit forms are handled identically downstream.
 - Point the clause source location at the original combiner expression to preserve debug info fidelity.
 - Provide an initializer for declare-reduction today; do not rely on the no-initializer path until implemented.
+
+---
+
+## [Flang][OpenMP] Implement workdistribute construct lowering
+
+Overview
+- Purpose: Lower Fortran array-notation style kernels inside `teams { workdistribute { ... } }` into executable OpenMP dialect using `teams { parallel { distribute { wsloop { ... } } } }`, including region fission and hoisting of non-parallel code for correctness on devices.
+- Scope: New Flang Optimizer/OpenMP pass, verifier/legality checks, runtime-oriented lowering for array assignments, and tests.
+
+Spec Reference
+- OpenMP 6.0 — Workdistribute: worksharing semantics bound to the innermost TEAMS region; no device-wide barrier between arbitrary regions.
+
+Semantics
+- Transformations:
+	- Fission/Hoist: Split `teams{workdistribute}` to isolate parallel parts and hoist legal non-OpenMP ops out of device kernels where possible.
+	- Loop Lowering: Convert `fir.do_loop unordered` within workdistribute regions to `teams { parallel { distribute { wsloop { ... } } } }`.
+	- Runtime Copies: Replace intrinsic array-to-array assigns with `omp.target_memcpy`; handle scalar-to-array assigns via specialized lowering; manage temporaries via `omp.target_allocmem/target_freemem`.
+- Verifier ensures placement legality, supported shapes, and `omp.teams` binding.
+
+Reference
+- Implementation PR: https://github.com/llvm/llvm-project/pull/140523 (merged)
+
+## Change Log (PR #140523)
+- Flang Optimizer: `flang/lib/Optimizer/OpenMP/LowerWorkdistribute.cpp` — introduce pass to rewrite `teams{workdistribute}` regions; perform region fission, loop conversions, and runtime copy lowering.
+```diff
+@@
++#include "mlir/Dialect/OpenMP/OpenMPDialect.h"
++#include "mlir/IR/PatternMatch.h"
++#include "mlir/Pass/Pass.h"
++using namespace mlir;
++namespace {
++struct LowerWorkdistributePass
++    : public PassWrapper<LowerWorkdistributePass, OperationPass<ModuleOp>> {
++  void runOnOperation() final {
++    ModuleOp mod = getOperation();
++    mod.walk([&](omp::TeamsOp teams) {
++      // Find nested workdistribute and lower to teams{parallel{distribute{wsloop}}}
++    });
++  }
++};
++} // namespace
+```
+- Build System: `flang/lib/Optimizer/OpenMP/CMakeLists.txt` — add the new source to the OpenMP optimizer library.
+```diff
+@@
+-  OpenMPToFIR.cpp
++  OpenMPToFIR.cpp
++  LowerWorkdistribute.cpp
+	 DEPENDS
+			FIRDialect
+	 )
+```
+- Tests: `flang/test/Optimizer/OpenMP/lower-workdistribute.fir` — check teams→parallel→distribute→wsloop nesting.
+```diff
+@@
+// RUN: bbc -fopenmp -o - %s | FileCheck %s
+
+func.func @kernel(%n: index, %A: memref<?xf32>, %B: memref<?xf32>) {
+	omp.teams {
+		// CHECK: omp.teams
+		// CHECK: omp.parallel
+		// CHECK: omp.distribute
+		// CHECK: omp.wsloop
+	}
+	return
+}
+```
+
+Pitfalls & Reviewer Notes
+- Correctness vs performance: Without a device-wide barrier, some programs require splitting into multiple kernels; ensure cross-split values are preserved via temporaries and mapped appropriately.
+- Nesting legality: Enforce that `workdistribute` binds to the innermost `teams` region; avoid silently fixing illegal nesting in lowering.
+- Runtime APIs: Prefer `omp.target_memcpy` and allocator APIs over ad-hoc intrinsics to match OpenMP runtime semantics.
+
+Related Issues/PRs
+- Complements: #154376 (OpenMP dialect op), #154377 (Flang parser/semantics), #154378 (Flang lowering to dialect op).
+
+Source Code Links
+- Files changed view: https://github.com/llvm/llvm-project/pull/140523/files
+
+How To Avoid Pitfalls
+- Validate preconditions before transforming; when inserting splits, materialize per-team temporaries for values live across kernels.
+- Keep semantic enforcement in parser/semantics; lowering should assume verified inputs and avoid silent legalization.
 
 ---
