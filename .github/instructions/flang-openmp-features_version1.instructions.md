@@ -3,7 +3,7 @@ applyTo: flang/lib/Parser/openmp*,flang/lib/Semantics/*omp*,flang/lib/Lower/Open
 ---
 
 Status
-- PRs included: 1
+- PRs included: 2
 - Last modified: 2026-01-28
 
 # OpenMP Features (Version 1 maintained to reduce the conflict with newer versions)
@@ -310,5 +310,231 @@ Reference
 **Runtime Semantics**
 - **Device ID propagation:** The `omp.target` device clause lowers to an `i64` device id passed as the 2nd argument to `__tgt_target_kernel`. Narrower types (`i16/i32`) are sign-extended; `i64` passes through.
 - **Default behavior:** If no device clause is present, `DeviceID` defaults to `OMP_DEVICEID_UNDEF` via `OpenMPIRBuilder` runtime attributes.
+
+---
+
+## [flang][mlir][OpenMP] Add support for uniform clause in declare simd
+
+Overview
+- Purpose: Add support for the `uniform(...)` clause on `declare simd`, enabling SIMD variants where specified arguments are uniform (identical across lanes).
+- Scope: Declarative directive `declare simd` in Flang (semantics + lowering) and MLIR OpenMP dialect representation.
+
+Spec Reference
+- OpenMP 5.2 — Declare SIMD directive and `uniform` clause semantics.
+
+Semantics
+- Parameters listed in `uniform(...)` are treated as uniform across SIMD lanes for the SIMD variant of the routine.
+- Enforce that `uniform` parameters are dummy arguments of the associated procedure.
+
+Reference
+- Implementation PR: https://github.com/llvm/llvm-project/pull/176046 (merged)
+- Summary: Define `uniform` clause in MLIR OpenMP and emit from Flang; add semantic checks and tests.
+
+## Change Log (PR #)
+- **Flang Lowering (impl):** `flang/lib/Lower/OpenMP/ClauseProcessor.cpp` — add processor for `uniform` clause.
+```diff
+@@ -1716,6 +1716,16 @@ bool ClauseProcessor::processUseDevicePtr(
+	return clauseFound;
+ }
+ 
++bool ClauseProcessor::processUniform(
++    mlir::omp::UniformClauseOps &result) const {
++  return findRepeatableClause<omp::clause::Uniform>(
++      [&](const omp::clause::Uniform &clause, const parser::CharBlock &) {
++        const auto &objects = clause.v;
++        if (!objects.empty())
++          genObjectList(objects, converter, result.uniformVars);
++      });
++}
+```
+
+- **Flang Lowering (decl):** `flang/lib/Lower/OpenMP/ClauseProcessor.h` — declare `processUniform`.
+```diff
+@@ -168,6 +168,7 @@ class ClauseProcessor {
+	lower::StatementContext &stmtCtx,
+	mlir::omp::UseDevicePtrClauseOps &result,
+	llvm::SmallVectorImpl<const semantics::Symbol *> &useDeviceSyms) const;
++  bool processUniform(mlir::omp::UniformClauseOps &result) const;
+ 
+	// Call this method for these clauses that should be supported but are not
+	// implemented yet. It triggers a compilation error if any of the given
+```
+
+- **Flang Lowering:** `flang/lib/Lower/OpenMP/OpenMP.cpp` — wire up uniform processing for `declare simd`.
+```diff
+@@ -3848,7 +3848,7 @@ genOMP(lower::AbstractConverter &converter, lower::SymMap &symTable,
+	cp.processAligned(clauseOps);
+	cp.processLinear(clauseOps);
+	cp.processSimdlen(clauseOps);
+-  cp.processTODO<clause::Uniform>(loc, llvm::omp::Directive::OMPD_declare_simd);
++  cp.processUniform(clauseOps);
+ 
+	mlir::omp::DeclareSimdOp::create(converter.getFirOpBuilder(), loc, clauseOps);
+ }
+```
+
+- **Flang Semantics:** `flang/lib/Semantics/check-omp-structure.cpp` — validate `uniform` names are dummy arguments of the enclosing procedure.
+```diff
+@@ -1446,6 +1446,28 @@ void OmpStructureChecker::Enter(const parser::OpenMPDeclareSimdConstruct &x) {
+	const parser::OmpDirectiveName &dirName{x.v.DirName()};
+	PushContextAndClauseSets(dirName.source, dirName.v);
+ 
++  const Scope &containingScope = context_.FindScope(dirName.source);
++  const Scope &progUnitScope = GetProgramUnitContaining(containingScope);
++
++  for (const parser::OmpClause &clause : x.v.Clauses().v) {
++    const auto *u = std::get_if<parser::OmpClause::Uniform>(&clause.u);
++    if (!u)
++      continue;
++    assert(clause.Id() == llvm::omp::Clause::OMPC_uniform);
++
++    for (const parser::Name &name : u->v) {
++      const Symbol *sym{name.symbol};
++      if (!sym || !IsDummy(*sym) ||
++          &GetProgramUnitContaining(sym->owner()) != &progUnitScope) {
++        context_.Say(name.source,
++            "Variable '%s' in UNIFORM clause must be a dummy argument of the "
++            "enclosing procedure"_err_en_US,
++            name.ToString());
++      }
++    }
++  }
+ 
+	const parser::OmpArgumentList &args{x.v.Arguments()};
+	if (args.v.empty()) {
+```
+
+- **Flang Tests (Lowering):** `flang/test/Lower/OpenMP/declare-simd.f90` — add uniform clause cases and combined clause coverage.
+```diff
+@@ -73,11 +73,40 @@ end subroutine declare_simd_simdlen
+ 
++subroutine declare_simd_uniform(x, y, n, i)
++#ifdef OMP_60
++!$omp declare_simd uniform(x, y)
++#else
++!$omp declare simd uniform(x, y)
++#endif
++
++  real(8), pointer, intent(inout) :: x(:)
++  real(8), pointer, intent(in) :: y(:)
++  integer, intent(in) :: n, i
++
++  if (i <= n) then
++    x(i) = x(i) + y(i)
++  end if
++end subroutine declare_simd_uniform
++
+@@ -105,4 +134,7 @@ end subroutine declare_simd_combined
+-!$omp declare simd aligned(x, y : 64) linear(i) simdlen(8)
++!$omp declare simd aligned(x, y : 64) linear(i) simdlen(8) uniform(x, y)
+ ! CHECK-SAME: simdlen(8)
+ ! CHECK-SAME: {linear_var_types = [i32]}
++! CHECK-SAME: uniform(%[[X_DECL]]#0 : !fir.ref<!fir.box<!fir.ptr<!fir.array<?xf64>>>>,
++! CHECK-SAME: %[[Y_DECL]]#0 : !fir.ref<!fir.box<!fir.ptr<!fir.array<?xf64>>>>)
+```
+
+- **Flang Tests (Semantics):** `flang/test/Semantics/OpenMP/declare-simd-uniform.f90` — add negative test and update RUN line.
+```diff
+@@ -1,4 +1,4 @@
+-! RUN: %python %S/../test_errors.py %s %flang -fopenmp
++! RUN: %python %S/../test_errors.py %s %flang -fopenmp -cpp -DNEGATIVE
+@@
++#ifdef NEGATIVE
++function bad_uniform(a,b,i) result(c)
++  double precision :: a(*), b(*), c
++  integer :: i
++  double precision :: local
++  !ERROR: Variable 'local' in UNIFORM clause must be a dummy argument of the enclosing procedure
++  !$omp declare simd(bad_uniform) uniform(a,local)
++  c = a(i) + b(i) + local
++end function
++#endif
+```
+
+- **MLIR Dialect (clauses):** `mlir/include/mlir/Dialect/OpenMP/OpenMPClauses.td` — define `OpenMP_UniformClause` with assembly format.
+```diff
+@@ -1532,4 +1532,28 @@
++//===----------------------------------------------------------------------===//
++// V5.2: [5.10] `uniform` clause
++//===----------------------------------------------------------------------===//
++class OpenMP_UniformClauseSkip<
++  bit traits = false, bit arguments = false, bit assemblyFormat = false,
++  bit description = false, bit extraClassDeclaration = false>
++  : OpenMP_Clause<traits, arguments, assemblyFormat, description,
++                  extraClassDeclaration> {
++  let arguments = (ins Variadic<OpenMP_PointerLikeType>:$uniform_vars);
++  let optAssemblyFormat = [{
++    `uniform` `(` custom<UniformClause>($uniform_vars, type($uniform_vars)) `)`
++  }];
++  let description = [{
++    The `uniform` clause declares one or more arguments to have an invariant
++    value for all concurrent invocations of the function in the execution of
++    a single SIMD loop.
++  }];
++}
++def OpenMP_UniformClause : OpenMP_UniformClauseSkip<>;
+```
+
+- **MLIR Dialect (ops):** `mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td` — add `OpenMP_UniformClause` to `omp.declare_simd`.
+```diff
+@@ -2248,7 +2248,7 @@ def DeclareSimdOp
+-    OpenMP_SimdlenClause]>
++    OpenMP_SimdlenClause, OpenMP_UniformClause]>
+```
+
+- **MLIR Impl:** `mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp` — parse/print uniform clause and plumb through builder.
+```diff
+@@ -4485,7 +4485,37 @@ void DeclareSimdOp::build(OpBuilder &odsBuilder, OperationState &odsState,
+-  clauses.linearVarTypes, clauses.simdlen);
++  clauses.linearVarTypes, clauses.simdlen,
++  clauses.uniformVars);
+@@
++// Parser and printer for Uniform Clause
++static ParseResult parseUniformClause(OpAsmParser &parser,
++    SmallVectorImpl<OpAsmParser::UnresolvedOperand> &uniformVars,
++    SmallVectorImpl<Type> &uniformTypes) {
++  return parser.parseCommaSeparatedList([&]() -> mlir::ParseResult {
++    if (parser.parseOperand(uniformVars.emplace_back()) ||
++        parser.parseColonType(uniformTypes.emplace_back()))
++      return mlir::failure();
++    return mlir::success();
++  });
++}
++static void printUniformClause(OpAsmPrinter &p, Operation *op,
++    ValueRange uniformVars, TypeRange uniformTypes) {
++  for (unsigned i = 0; i < uniformVars.size(); ++i) {
++    if (i != 0)
++      p << ", ";
++    p << uniformVars[i] << " : " << uniformTypes[i];
++  }
++}
+```
+
+- **MLIR Tests:** `mlir/test/Dialect/OpenMP/ops.mlir` — add dedicated uniform test and all-clauses coverage.
+```diff
+@@ -3414,6 +3414,17 @@ func.func @omp_declare_simd_linear(%a: f64, %b: f64, %iv: i32, %step: i32) -> ()
++// CHECK-LABEL: func.func @omp_declare_simd_uniform
++func.func @omp_declare_simd_uniform(%a: f64, %b: f64,
++  %p0: memref<i32>, %p1: memref<i32>) -> () {
++  // CHECK: omp.declare_simd
++  // CHECK-SAME: uniform(
++  // CHECK-SAME: %{{.*}} : memref<i32>,
++  // CHECK-SAME: %{{.*}} : memref<i32>)
++  omp.declare_simd uniform(%p0 : memref<i32>, %p1 : memref<i32>)
++  return
++}
+@@ -3424,9 +3435,13 @@ func.func @omp_declare_simd_all_clauses(%a: f64, %b: f64,
+ // CHECK-SAME: simdlen(8)
++// CHECK-SAME: uniform(
++// CHECK-SAME: %{{.*}} : memref<i32>,
++// CHECK-SAME: %{{.*}} : memref<i32>)
+	omp.declare_simd simdlen(8)
+	aligned(%p0 : memref<i32> -> 32 : i64,
+			  %p1 : memref<i32> -> 128 : i64)
+	linear(%iv = %step : i32)
++  uniform(%p0 : memref<i32>, %p1 : memref<i32>)
+	return
+ }
+```
 
 ---
