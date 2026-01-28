@@ -311,6 +311,13 @@ Reference
 - **Device ID propagation:** The `omp.target` device clause lowers to an `i64` device id passed as the 2nd argument to `__tgt_target_kernel`. Narrower types (`i16/i32`) are sign-extended; `i64` passes through.
 - **Default behavior:** If no device clause is present, `DeviceID` defaults to `OMP_DEVICEID_UNDEF` via `OpenMPIRBuilder` runtime attributes.
 
+Pitfalls & Reviewer Notes
+- Ensure device id is sign-extended or truncated to `i64` before calling the offload runtime; mismatched width can break targets expecting `i64`.
+- Do not reinterpret `-1`; let the runtime handle “default device”. Keep logic consistent with `OMP_DEVICEID_UNDEF`.
+- Clause validation: current device checks are added for `target_update` and `target_data`; keep `target` checks aligned with existing validation helpers to avoid duplicate diagnostics.
+- ABI ordering: The device id is the second argument to `__tgt_target_kernel`; changing ordering breaks compatibility.
+- Tests should cover both SSA values and immediates (multiple widths) to guard against regressions in casts.
+
 ---
 
 ## [flang][mlir][OpenMP] Add support for uniform clause in declare simd
@@ -330,7 +337,7 @@ Reference
 - Implementation PR: https://github.com/llvm/llvm-project/pull/176046 (merged)
 - Summary: Define `uniform` clause in MLIR OpenMP and emit from Flang; add semantic checks and tests.
 
-## Change Log (PR #)
+## Change Log (PR #176046)
 - **Flang Lowering (impl):** `flang/lib/Lower/OpenMP/ClauseProcessor.cpp` — add processor for `uniform` clause.
 ```diff
 @@ -1716,6 +1716,16 @@ bool ClauseProcessor::processUseDevicePtr(
@@ -536,5 +543,12 @@ Reference
 	return
  }
 ```
+
+Pitfalls & Reviewer Notes
+- Uniform variables must be dummy arguments of the enclosing procedure (reviewer request); emit clear diagnostics for locals or host-associated symbols.
+- MLIR assembly: `uniform(%arg : type, …)` printing/parsing must preserve both SSA ids and types; keep tests resilient to spacing/ordering.
+- Clause interactions: Combining `uniform` with `aligned`, `linear`, and `simdlen` changes operand segment sizes; ensure builder and traits stay consistent.
+- Frontend differences: For OMP 5.0 vs 5.2 spelling (`declare simd` vs `declare_simd`), guard tests with `-cpp` defines as needed.
+- Negative testing: Enable `-cpp -DNEGATIVE` path in semantics tests to exercise error cases reliably in CI.
 
 ---
