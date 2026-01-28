@@ -3,7 +3,7 @@ applyTo: flang/lib/Parser/openmp*,flang/lib/Semantics/*omp*,flang/lib/Lower/Open
 ---
 
 Status
-- PRs included: 2
+- PRs included: 3
 - Last modified: 2026-01-28
 
 # OpenMP Features (Version 1 maintained to reduce the conflict with newer versions)
@@ -550,5 +550,179 @@ Pitfalls & Reviewer Notes
 - Clause interactions: Combining `uniform` with `aligned`, `linear`, and `simdlen` changes operand segment sizes; ensure builder and traits stay consistent.
 - Frontend differences: For OMP 5.0 vs 5.2 spelling (`declare simd` vs `declare_simd`), guard tests with `-cpp` defines as needed.
 - Negative testing: Enable `-cpp -DNEGATIVE` path in semantics tests to exercise error cases reliably in CI.
+
+---
+
+## [llvm][mlir][OpenMP] Support translation for linear clause in omp.wsloop and omp.simd
+
+Overview
+- Purpose: Add end-to-end support to lower/translate the `linear` clause for `omp.wsloop` (Fortran `!$omp do`) and `omp.simd` through Flang → MLIR OpenMP dialect → LLVM IR.
+- Scope: Flang clause processing for `linear`, MLIR OpenMP dialect storage of linear variable types, and LLVM IR translation to implement linear semantics. Adds targeted tests.
+
+Spec Reference
+- OpenMP 5.2 — Linear clause on loop and SIMD constructs. See linear(var[:step]) semantics and permitted modifiers.
+
+Semantics
+- Each variable in `linear(...)` evolves linearly with the logical iteration: value at iteration k is base + k × step (default step = 1). Implementation stores linear variable types on the ops to support correct LLVM lowering without assuming alloca provenance.
+
+Reference
+- Implementation PR: https://github.com/llvm/llvm-project/pull/139386 (merged)
+- Summary: Wire `linear` through Flang clause handling for wsloop/simd, model `linear_var_types` on MLIR ops, and implement LLVM translation, with tests covering base and step forms.
+
+## Change Log (PR #139386)
+- **Flang Lowering:** `flang/lib/Lower/OpenMP/ClauseProcessor.cpp` — capture linear var types into an array attribute on the op.
+```diff
+@@ -1241,11 +1241,20 @@ bool ClauseProcessor::processLinear(mlir::omp::LinearClauseOps &result) const {
+	auto &objects = std::get<omp::ObjectList>(clause.t);
++  static std::vector<mlir::Attribute> typeAttrs;
++  if (!result.linearVars.size())
++    typeAttrs.clear();
+	for (const omp::Object &object : objects) {
+	  semantics::Symbol *sym = object.sym();
+	  const mlir::Value variable = converter.getSymbolAddress(*sym);
+	  result.linearVars.push_back(variable);
++    mlir::Type ty = converter.genType(*sym);
++    typeAttrs.push_back(mlir::TypeAttr::get(ty));
+	}
++  result.linearVarTypes =
++      mlir::ArrayAttr::get(&converter.getMLIRContext(), typeAttrs);
+	if (objects.size()) {
+	  if (auto &mod =
+			std::get<std::optional<omp::clause::Linear::StepComplexModifier>>(
+```
+- **Flang Lowering:** `flang/lib/Lower/OpenMP/OpenMP.cpp` — enable `linear` processing on `simd` and `wsloop`.
+```diff
+@@ -1636,8 +1636,7 @@ static void genSimdClauses(
+	cp.processReduction(loc, clauseOps, reductionSyms);
+	cp.processSafelen(clauseOps);
+	cp.processSimdlen(clauseOps);
+-  
+-  cp.processTODO<clause::Linear>(loc, llvm::omp::Directive::OMPD_simd);
++  cp.processLinear(clauseOps);
+@@ -1831,9 +1830,9 @@ static void genWsloopClauses(
+	cp.processOrdered(clauseOps);
+	cp.processReduction(loc, clauseOps, reductionSyms);
+	cp.processSchedule(stmtCtx, clauseOps);
++  cp.processLinear(clauseOps);
+ 
+-  cp.processTODO<clause::Allocate, clause::Linear>(
+-      loc, llvm::omp::Directive::OMPD_do);
++  cp.processTODO<clause::Allocate>(loc, llvm::omp::Directive::OMPD_do);
+ }
+```
+- **Flang Tests:** add `simd-linear.f90` and `wsloop-linear.f90`; remove obsolete todo test.
+```diff
+--- a/flang/test/Lower/OpenMP/Todo/omp-do-simd-linear.f90
++++ /dev/null
+@@
+- (file removed)
+```
+```diff
+@@ -0,0 +1,57 @@
+! RUN: %flang_fc1 -fopenmp -emit-hlfir %s -o - 2>&1 | FileCheck %s
+subroutine simple_linear
+  implicit none
+  integer :: x, y, i
+  !$omp simd linear(x)
+  do i = 1, 10
+	 y = x + 2
+  end do
+  ! CHECK: } {linear_var_types = [i32]}
+end subroutine
+```
+```diff
+@@ -0,0 +1,60 @@
+! RUN: %flang_fc1 -fopenmp -emit-hlfir %s -o - 2>&1 | FileCheck %s
+subroutine simple_linear
+  implicit none
+  integer :: x, y, i
+  !$omp do linear(x)
+  do i = 1, 10
+	 y = x + 2
+  end do
+  !$omp end do
+  ! CHECK: } {linear_var_types = [i32]}
+end subroutine
+```
+- **MLIR Clauses:** `mlir/include/mlir/Dialect/OpenMP/OpenMPClauses.td` — add `linear_var_types` attribute and include BuiltinAttributes.
+```diff
+@@ -21,6 +24,7 @@
+ include "mlir/Dialect/OpenMP/OpenMPOpBase.td"
+ include "mlir/IR/SymbolInterfaces.td"
++include "mlir/IR/BuiltinAttributes.td"
+@@ -723,10 +729,9 @@ class OpenMP_LinearClauseSkip<
+-  let arguments = (ins
+-      Variadic<AnyType>:$linear_vars,
+-      Variadic<I32>:$linear_step_vars);
++  let arguments = (ins Variadic<AnyType>:$linear_vars,
++      Variadic<I32>:$linear_step_vars,
++      OptionalAttr<ArrayAttr>:$linear_var_types);
+```
+- **MLIR Ops Impl:** `mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp` — plumb `linearVarTypes` for `wsloop` and `simd` builders; update verifier accordingly.
+```diff
+@@ -2825,6 +2828,7 @@ void WsloopOp::build(OpBuilder &builder, OperationState &state,
+	build(builder, state, /*allocate_vars=*/{}, /*allocator_vars=*/{},
+			/*linear_vars=*/ValueRange(), /*linear_step_vars=*/ValueRange(),
++        /*linear_var_types*/ nullptr,
+			/*nowait=*/false, /*order=*/nullptr, /*order_mod=*/nullptr,
+			/*ordered=*/nullptr, /*private_vars=*/{}, /*private_syms=*/nullptr,
+@@ -2843,8 +2847,8 @@ void WsloopOp::build(
+	WsloopOp::build(
+		 builder, state,
+		 /*allocate_vars=*/{}, /*allocator_vars=*/{}, clauses.linearVars,
+-      clauses.linearStepVars, clauses.nowait, clauses.order, clauses.orderMod,
++      clauses.linearStepVars, clauses.linearVarTypes, clauses.nowait,
++      clauses.order, clauses.orderMod,
+		 clauses.ordered, clauses.privateVars,
+@@ -2889,17 +2890,16 @@ LogicalResult WsloopOp::verifyRegions() {
+-  // TODO Store clauses in op: linearVars, linearStepVars
+-  SimdOp::build(builder, state, clauses.alignedVars,
+-                makeArrayAttr(ctx, clauses.alignments), clauses.ifExpr,
+-                /*linear_vars=*/{}, /*linear_step_vars=*/{},
+-                clauses.nontemporalVars, clauses.order, clauses.orderMod,
+-                clauses.privateVars, makeArrayAttr(ctx, clauses.privateSyms),
+-                clauses.privateNeedsBarrier, clauses.reductionMod,
+-                clauses.reductionVars,
+-                makeDenseBoolArrayAttr(ctx, clauses.reductionByref),
+-                makeArrayAttr(ctx, clauses.reductionSyms), clauses.safelen,
+-                clauses.simdlen);
++  SimdOp::build(
++      builder, state, clauses.alignedVars,
++      makeArrayAttr(ctx, clauses.alignments), clauses.ifExpr,
++      clauses.linearVars, clauses.linearStepVars, clauses.linearVarTypes,
++      clauses.nontemporalVars, clauses.order, clauses.orderMod,
++      clauses.privateVars, makeArrayAttr(ctx, clauses.privateSyms),
++      clauses.privateNeedsBarrier, clauses.reductionMod, clauses.reductionVars,
++      makeDenseBoolArrayAttr(ctx, clauses.reductionByref),
++      makeArrayAttr(ctx, clauses.reductionSyms), clauses.safelen,
++      clauses.simdlen);
+```
+
+Pitfalls & Reviewer Notes
+- Do not assume linear vars originate from allocas; types must be conveyed explicitly (attribute) for correct LLVM lowering.
+- Avoid redundant barriers around linear variable processing in LLVM IR emission.
+- Keep MLIR tests canonical (e.g., `mlir-opt --canonicalize`) to reduce noise; ensure access group metadata propagates to loads/stores as required.
+- Versioning pitfalls: Some tests (e.g., with step-complex-modifier) rely on OpenMP 5.2; default toolchains using older OpenMP versions may warn where an error is expected.
+- Naming clarity: Prefer `split*` terminology over “outline” for basic block splitting in linear finalization (review feedback).
+
+Related Issues/PRs
+- Stacked before: https://github.com/llvm/llvm-project/pull/139385
+- Follow-up (implicit linearization): https://github.com/llvm/llvm-project/pull/150386 (merged)
+- Additional checks/tests: https://github.com/llvm/llvm-project/pull/174916 (merged)
+- Testsuite adjustment: https://github.com/llvm/llvm-test-suite/pull/308 (merged)
+
+Source Code Links
+- Flang: `ClauseProcessor.cpp` https://github.com/llvm/llvm-project/pull/139386/files#diff-55798c5090a8f8499f773b3fb46fb98a7aabe0f58ec60ff295e107acb36c7707
+- Flang: `OpenMP.cpp` https://github.com/llvm/llvm-project/pull/139386/files#diff-496a295679ae3c43f8651c944a1bd9dca177ad2b5e4d7121f96938024e292bc1
+- MLIR: `OpenMPClauses.td` https://github.com/llvm/llvm-project/pull/139386/files#diff-0a931c4acc64c5d1088e87fc4688545b139ac506da7b354263b1370304fd6ae5
+- MLIR: `OpenMPDialect.cpp` https://github.com/llvm/llvm-project/pull/139386/files#diff-a897370ad8f5ad37e8c1adb3c145c2304aaa38da3227bc1d02ac701ee8dc0754
+- MLIR: `OpenMPToLLVMIRTranslation.cpp` https://github.com/llvm/llvm-project/pull/139386/files#diff-2cbb5651f4570d81d55ac4198deda0f6f7341b2503479752ef2295da3774c586
+- Tests: `simd-linear.f90`, `wsloop-linear.f90`, `openmp-llvm.mlir` (files tab in PR)
+
+How To Avoid Pitfalls
+- Provide `linear_var_types` on MLIR ops; never rely on inferring element types from pointer operands during LLVM translation.
+- Ensure Flang semantics guard invalid linear vars (type/REF requirements) and that lowering/translation assumes validated inputs.
+- Keep IR emission minimal: remove unnecessary barriers/conditionals; rely on canonical optimizer passes for cleanup.
+- When writing tests that depend on OpenMP 5.2 features, pass appropriate `-fopenmp-version=52` (or gate with `-cpp` defines) to avoid misleading warnings.
 
 ---
