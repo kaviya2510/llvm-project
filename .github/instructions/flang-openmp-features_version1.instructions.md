@@ -3,7 +3,7 @@ applyTo: flang/lib/Parser/openmp*,flang/lib/Semantics/*omp*,flang/lib/Lower/Open
 ---
 
 Status
-- PRs included: 3
+- PRs included: 4
 - Last modified: 2026-01-28
 
 # OpenMP Features (Version 1 maintained to reduce the conflict with newer versions)
@@ -724,5 +724,169 @@ How To Avoid Pitfalls
 - Ensure Flang semantics guard invalid linear vars (type/REF requirements) and that lowering/translation assumes validated inputs.
 - Keep IR emission minimal: remove unnecessary barriers/conditionals; rely on canonical optimizer passes for cleanup.
 - When writing tests that depend on OpenMP 5.2 features, pass appropriate `-fopenmp-version=52` (or gate with `-cpp` defines) to avoid misleading warnings.
+
+---
+
+## [flang][OpenMP] Implement COMBINER clause
+
+Overview
+- Purpose: Introduce the OpenMP 6.0 `COMBINER(...)` clause support in Flang for `declare reduction`, representing the combiner expression as a first-class clause to unify lowering. Reuse existing combiner-expression evaluation to build the reduction combiner callback.
+- Scope: Flang parser and utilities, clause lowering helpers, declare-reduction lowering flow; minor structure/test updates.
+
+Spec Reference
+- OpenMP 6.0 — `declare reduction` with `COMBINER(combiner-expr)` clause; stylized instances permit `omp_out`/`omp_in` parameters and optional variable decls.
+
+Semantics
+- If a `COMBINER` clause appears, treat it as the authoritative combiner definition for the `declare reduction` identifier.
+- If missing, synthesize an internal `combiner` clause from the reduction specifier’s combiner expression so downstream lowering paths are uniform. The synthesized clause’s source location points at the original combiner expression for accurate debug info.
+- Build the combiner callback by evaluating the stylized instance with `omp_out`/`omp_in`, handling by-ref/by-val appropriately.
+- The initializer clause is still required in current implementation; declare-reduction without an initializer emits a TODO diagnostic.
+
+Reference
+- Implementation PR: https://github.com/llvm/llvm-project/pull/172036 (merged)
+- Summary: Add `OmpCombinerClause` to the parser, wire `Combiner` through lowering with `StylizedInstance`, introduce `appendCombiner` to normalize presence of combiner, update declare-reduction lowering to consume the clause, and adjust helpers/utilities/tests.
+
+## Change Log (PR #172036)
+- Flang Lowering Types: `flang/include/flang/Lower/OpenMP/Clauses.h` — add aliases and helpers for stylized instances and combiner clause.
+```diff
+@@ -104,6 +104,7 @@ struct hash<Fortran::lower::omp::IdTy> {
+ namespace Fortran::lower::omp {
+	 using Object = tomp::ObjectT<IdTy, ExprTy>;
+	 using ObjectList = tomp::ObjectListT<IdTy, ExprTy>;
+ + using StylizedInstance = tomp::type::StylizedInstanceT<IdTy, ExprTy>;
+@@
+	 std::optional<Object> getBaseObject(const Object &object,
+																				semantics::SemanticsContext &semaCtx);
+ + StylizedInstance makeStylizedInstance(const parser::OmpStylizedInstance &inp,
+ +                                       semantics::SemanticsContext &semaCtx);
+@@
+	 using Collector = tomp::clause::CollectorT<TypeTy, IdTy, ExprTy>;
+ + using Combiner = tomp::clause::CombinerT<TypeTy, IdTy, ExprTy>;
+	 using Compare = tomp::clause::CompareT<TypeTy, IdTy, ExprTy>;
+```
+- Parser Dump: `flang/include/flang/Parser/dump-parse-tree.h` — print the combiner clause node.
+```diff
+@@ -562,6 +562,7 @@ class ParseTreeDumper {
+	 NODE(parser, OmpClauseList)
+	 NODE(parser, OmpCloseModifier)
+	 NODE_ENUM(OmpCloseModifier, Value)
+ + NODE(parser, OmpCombinerClause)
+	 NODE(parser, OmpCombinerExpression)
+```
+- Parser Utils: `flang/include/flang/Parser/openmp-utils.h` — provide overloads to retrieve combiner/initializer from either specifier or clause.
+```diff
+@@ -226,9 +226,9 @@
+- const OmpCombinerExpression *GetCombinerExpr(
+-     const OmpReductionSpecifier &rspec);
+- const OmpInitializerExpression *GetInitializerExpr(const OmpClause &init);
++ const OmpCombinerExpression *GetCombinerExpr(const OmpReductionSpecifier &x);
++ const OmpCombinerExpression *GetCombinerExpr(const OmpClause &x);
++ const OmpInitializerExpression *GetInitializerExpr(const OmpClause &x);
+```
+- Parser AST: `flang/include/flang/Parser/parse-tree.h` — add `OmpCombinerClause` wrapper (since 6.0) around `OmpCombinerExpression`.
+```diff
+@@ -4395,6 +4395,14 @@
+ // combiner-clause -> // since 6.0
+ // COMBINER(combiner-expr)
+ struct OmpCombinerClause {
+	 WRAPPER_CLASS_BOILERPLATE(OmpCombinerClause, OmpCombinerExpression);
+ };
+```
+- ClauseProcessor: `flang/lib/Lower/OpenMP/ClauseProcessor.cpp` — use `StylizedInstance` in initializer processing and emit a TODO if initializer is absent.
+```diff
+@@ -390,10 +390,10 @@ bool ClauseProcessor::processInitializer(
+-  const clause::StylizedInstance &inst = clause->v.front();
++  const StylizedInstance &inst = clause->v.front();
+@@ -412,7 +412,7 @@
+-  const semantics::SomeExpr &initExpr =
+-      std::get<clause::StylizedInstance::Instance>(inst.t);
++  const semantics::SomeExpr &initExpr =
++      std::get<StylizedInstance::Instance>(inst.t);
+@@ -439,7 +439,9 @@
+-  return false;
++  TODO(converter.getCurrentLocation(),
++       "declare reduction without an initializer clause is not yet supported");
+```
+- Clause Helpers: `flang/lib/Lower/OpenMP/Clauses.cpp` — introduce `makeStylizedInstance`, use it for both `Combiner` and `Initializer`.
+```diff
+@@ -197,6 +197,24 @@ std::optional<Object> getBaseObject(...)
+ + StylizedInstance makeStylizedInstance(const parser::OmpStylizedInstance &inp,
+ +                                       semantics::SemanticsContext &semaCtx) { ... }
+@@
+ + Combiner make(const parser::OmpClause::Combiner &inp,
+ +               semantics::SemanticsContext &semaCtx) {
+ +   const parser::OmpCombinerExpression &cexpr = inp.v.v;
+ +   Combiner combiner;
+ +   for (const parser::OmpStylizedInstance &sinst : cexpr.v)
+ +     combiner.v.push_back(makeStylizedInstance(sinst, semaCtx));
+ +   return combiner;
+ + }
+@@ -988,24 +1017,8 @@ Initializer make(...)
+- for (const parser::OmpStylizedInstance &sinst : iexpr.v) { ... }
++ for (const parser::OmpStylizedInstance &sinst : iexpr.v)
++   initializer.v.push_back(makeStylizedInstance(sinst, semaCtx));
+```
+- Declare Reduction Lowering: `flang/lib/Lower/OpenMP/OpenMP.cpp` — normalize/synthesize combiner clause, then generate combiner callback from clause.
+```diff
+@@ -3605,10 +3607,11 @@
+- static ReductionProcessor::GenCombinerCBTy processReductionCombiner(...,
+-     const parser::OmpReductionSpecifier &specifier) {
++ static ReductionProcessor::GenCombinerCBTy processReductionCombiner(...,
++     const clause::Combiner &combiner) {
+@@
+- const auto &combinerExpression = ...
+- const parser::OmpStylizedInstance &combinerInstance = ...
++ const StylizedInstance &inst = combiner.v.front();
++ semantics::SomeExpr evalExpr = std::get<StylizedInstance::Instance>(inst.t);
+@@
+- for (const parser::OmpStylizedDeclaration &decl : declList) { ... }
++ for (const Object &object : std::get<StylizedInstance::Variables>(inst.t)) { ... }
+@@ -3714,0 +3718,27 @@
++ // Ensure there's a combiner clause; synthesize one from the specifier if absent.
++ static const clause::Combiner &appendCombiner(
++     const parser::OpenMPDeclareReductionConstruct &construct,
++     List<Clause> &clauses, semantics::SemanticsContext &semaCtx) { ... }
+@@ -3742,6 +3776,6 @@ static void genOMP(..., const parser::OpenMPDeclareReductionConstruct &construct)
+- ReductionProcessor::GenCombinerCBTy genCombinerCB =
+-   processReductionCombiner(converter, symTable, semaCtx, specifier);
+- if (initializer.v.size() > 0) { ... } else { TODO(...); }
++ List<Clause> clauses = makeClauses(construct.v.Clauses(), semaCtx);
++ const clause::Combiner &combiner = appendCombiner(construct, clauses, semaCtx);
++ ReductionProcessor::GenCombinerCBTy genCombinerCB =
++   processReductionCombiner(converter, symTable, semaCtx, combiner);
++ ClauseProcessor cp(converter, semaCtx, clauses);
++ cp.processInitializer(symTable, genInitValueCB);
+```
+- Structure/Test Updates:
+	- `flang/lib/Semantics/check-omp-structure.cpp` — recognize `COMBINER` clause in structure checking (Files tab).
+	- `flang/test/Lower/OpenMP/declare-reduction-combiner.f90` — new coverage for declare reduction with explicit combiner clause.
+	- Minor headers/types: `ClauseT.h`, `OMP.td` touched for clause plumbing.
+
+Pitfalls & Reviewer Notes
+- Versioning: This introduces an OpenMP 6.0 clause. The implementation synthesizes an internal `combiner` clause even when compiling older OpenMP versions; reviewers questioned debug info impact. Author confirmed the clause’s source location points to the original combiner expression, avoiding debug info pollution. If you enable pretty-printing/round-trips, ensure version-aware gating to not emit 6.0 syntax accidentally.
+- Initializer requirement: `declare reduction` without an initializer currently triggers a TODO diagnostic in `processInitializer`. Provide an initializer until support is extended.
+- Symbol mapping: The combiner expects `omp_out`/`omp_in` bindings. Lowering now maps stylized declarations via `tomp::Object` entries; ensure semantic validation prevents unexpected names or missing symbols.
+- By-ref vs by-val: The combiner callback handles pass-by-reference types; verify addressability is established (create temporaries when needed) for non-byref operands.
+
+Related Issues/PRs
+- OpenMP 6.0 combiner introduction (spec item). Consider interactions with user-defined reductions across versions.
+
+Source Code Links
+- Flang: `Clauses.h` https://github.com/llvm/llvm-project/pull/172036/files#diff-678c35fa95a6f92b3ccf755d1a13c3d9ce0d97938485cc4e0befcedcf7317431
+- Flang: `ClauseProcessor.cpp` https://github.com/llvm/llvm-project/pull/172036/files#diff-55798c5090a8f8499f773b3fb46fb98a7aabe0f58ec60ff295e107acb36c7707
+- Flang: `Clauses.cpp` https://github.com/llvm/llvm-project/pull/172036/files#diff-99d9e5b508d4a4d583713a6f04701826652f16e69bb03d98014b82be66fb5807
+- Flang: `OpenMP.cpp` https://github.com/llvm/llvm-project/pull/172036/files#diff-496a295679ae3c43f8651c944a1bd9dca177ad2b5e4d7121f96938024e292bc1
+- Parser: `parse-tree.h` https://github.com/llvm/llvm-project/pull/172036/files#diff-61d1be39226db8b7f54d3241269d9fabff009139551605546e33f6463bd4087a
+- Parser: `dump-parse-tree.h` https://github.com/llvm/llvm-project/pull/172036/files#diff-062c8b30313609d423f975d2af9ec411e4b9fffbd782216ef55155564fd7649d
+- Parser Utils: `openmp-utils.h` https://github.com/llvm/llvm-project/pull/172036/files#diff-51997fc66e1482fe156eacca8178e9d98023027796ec5ce254db012d51e545b9
+- Semantics/Structure: `check-omp-structure.cpp` https://github.com/llvm/llvm-project/pull/172036/files#diff-be225bc038e95a229024c9f227284112f98fe31762bc0bb80605de425aadd084
+- Tests: `declare-reduction-combiner.f90` https://github.com/llvm/llvm-project/pull/172036/files#diff-201f7b087b6c84fa02ad3e26033ce3a58a550d46837ef34075cc48f136d00607
+- Misc: `ClauseT.h` https://github.com/llvm/llvm-project/pull/172036/files#diff-94ad6eac7c2c4bee1e4005bb660a43340224437e9ee4ab4266396bbffe9f1a81, `OMP.td` https://github.com/llvm/llvm-project/pull/172036/files#diff-b273fa9eb2357c7ff376e659e5e73c1f67859f750c3d0705ee6206200eed5bdf
+
+How To Avoid Pitfalls
+- Keep the combiner internal: prefer synthesizing/consuming the clause in lowering; avoid emitting 6.0 syntax in diagnostics/printing when targeting older versions.
+- Always run `appendCombiner` in declare-reduction lowering so both explicit and implicit forms are handled identically downstream.
+- Point the clause source location at the original combiner expression to preserve debug info fidelity.
+- Provide an initializer for declare-reduction today; do not rely on the no-initializer path until implemented.
 
 ---
