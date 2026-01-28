@@ -3,7 +3,7 @@ applyTo: flang/lib/Parser/openmp*,flang/lib/Semantics/*omp*,flang/lib/Lower/Open
 ---
 
 Status
-- PRs included: 4
+- PRs included: 6
 - Last modified: 2026-01-28
 
 # OpenMP Features (Version 1 maintained to reduce the conflict with newer versions)
@@ -727,6 +727,195 @@ How To Avoid Pitfalls
 
 ---
 
+## [flang][OpenMP] Parse OpenMP 6.0 syntax of INIT clause
+
+Overview
+- Purpose: Update Flang to parse and unparse the OpenMP 6.0 `INIT` clause syntax, introducing preference syntax (`PREFER_TYPE(...)`) with structured preference selectors and adjusting interop handling.
+- Scope: Parser AST (`parse-tree.h`), parser combinators (`openmp-parsers.cpp`), unparsing (`unparse.cpp`), feature dumping (`FeatureList.cpp`, `dump-parse-tree.h`), and semantics descriptors (`openmp-modifiers.{h,cpp}`). Also updates an interop test.
+
+Spec Reference
+- OpenMP 6.0 — Interoperability and `INIT` clause syntax updates: preference selector (`FR(...)` and `ATTR(...)` forms), preference specification, and `PREFER_TYPE(...)` grouping.
+
+Semantics
+- Replace deprecated `OmpInteropPreference` with `OmpPreferType` and add `OmpPreferenceSelector`/`OmpPreferenceSpecification` supporting `FR(expr)` and `ATTR(expr, ...)` forms and grouped `{ ... }` lists.
+- In `OmpInitClause`, modifiers now accept `OmpInteropType` and `OmpPreferType`; parser prioritizes `interop-type` before `prefer-type` to avoid ambiguity since `prefer-type` can carry arbitrary expressions.
+- Unparsing emits `PREFER_TYPE(...)` with either grouped selectors or foreign runtime identifier, and simplifies `INTEROP` directive unparsing to a generic `!$OMP ` followed by the specification.
+
+Reference
+- Implementation PR: https://github.com/llvm/llvm-project/pull/171702 (merged)
+- Summary: Introduce preference selector/types and wire them into `INIT` clause parsing/unparsing; update feature readers and semantics descriptors; remove deprecated interop preference nodes.
+
+## Change Log (PR #171702)
+- Feature Dumper: `flang/examples/FeatureList/FeatureList.cpp` — add readers for new preference nodes; remove deprecated interop preference entries.
+```diff
+@@ -495,6 +495,9 @@ struct NodeVisitor {
+ READ_FEATURE(OmpOrderClause::Ordering)
+ READ_FEATURE(OmpOrderModifier)
+ READ_FEATURE(OmpOrderModifier::Value)
+ + READ_FEATURE(OmpPreferenceSelector)
+ + READ_FEATURE(OmpPreferenceSpecification)
+ + READ_FEATURE(OmpPreferType)
+@@ -509,8 +512,6 @@
+ - READ_FEATURE(OmpInteropRuntimeIdentifier)
+ - READ_FEATURE(OmpInteropPreference)
+ READ_FEATURE(OmpInteropType)
+```
+- Parser Dump: `flang/include/flang/Parser/dump-parse-tree.h` — add new nodes, drop deprecated ones.
+```diff
+@@ -627,8 +627,6 @@ class ParseTreeDumper {
+ - NODE(parser, OmpInteropPreference)
+ - NODE(parser, OmpInteropRuntimeIdentifier)
+@@ -681,6 +679,9 @@
+ + NODE(parser, OmpPreferenceSelector)
+ + NODE(parser, OmpPreferenceSpecification)
+ + NODE(parser, OmpPreferType)
+```
+- Parser AST: `flang/include/flang/Parser/parse-tree.h` — add `OmpPreferenceSelector`, `OmpPreferenceSpecification`, and `OmpPreferType`; adjust `OmpInteropType` docs; update `OmpInitClause` to use `OmpPreferType`.
+```diff
+@@ -4034, + // Ref: [6.0:470-471]
+ + struct OmpPreferenceSelector { /* FR(expr) | ATTR(expr, ...) */ };
+ + struct OmpPreferenceSpecification { /* {selector...} | FR(expr) */ };
+ + struct OmpPreferType { WRAPPER_CLASS_BOILERPLATE(OmpPreferType, std::list<OmpPreferenceSpecification>); };
+@@ -4997, + struct OmpInitClause {
+ -   MODIFIER_BOILERPLATE(OmpInteropPreference, OmpInteropType);
+ +   MODIFIER_BOILERPLATE(OmpPreferType, OmpInteropType);
+ }
+```
+- Semantics Descriptors: `flang/include/flang/Semantics/openmp-modifiers.h` / `flang/lib/Semantics/openmp-modifiers.cpp` — remove `OmpInteropPreference` descriptor and add `OmpPreferType`.
+```diff
+@@ -85,7 +85,6 @@
+ - DECLARE_DESCRIPTOR(parser::OmpInteropPreference);
+@@ -96,6 +95,7 @@
+ + DECLARE_DESCRIPTOR(parser::OmpPreferType);
+```
+```diff
+@@ template<>
+ - const OmpModifierDescriptor &OmpGetDescriptor<parser::OmpInteropPreference>() { ... }
+@@ template<>
+ + const OmpModifierDescriptor &OmpGetDescriptor<parser::OmpPreferType>() { /* name="prefer-type", unique, applies to INIT */ }
+```
+- Parsers: `flang/lib/Parser/openmp-parsers.cpp` — add parsers for preference selector/specification/prefer-type; prioritize `interop-type` then `prefer-type` in `INIT` modifiers; accept `INIT` with updated `_id` literal.
+```diff
+@@ -898,6 +891,20 @@
+ + TYPE_PARSER(construct<OmpPreferenceSelector>("FR" >> parenthesized(indirect(expr))
+ +   || "ATTR" >> parenthesized(nonemptyList(indirect(expr)))))
+ + TYPE_PARSER(construct<OmpPreferenceSpecification>(braced(nonemptyList(Parser<OmpPreferenceSelector>()))
+ +   || construct<OmpPreferenceSpecification>(indirect(expr)))
+ + TYPE_PARSER(construct<OmpPreferType>("PREFER_TYPE" >> parenthesized(nonemptyList(Parser<OmpPreferenceSpecification>{}))))
+@@ -986,9 +993,9 @@
+ - construct<OmpInitClause::Modifier>(Parser<OmpInteropPreference>{})) ||
+ - construct<OmpInitClause::Modifier>(Parser<OmpInteropType>{})))
+ + construct<OmpInitClause::Modifier>(Parser<OmpInteropType>{}) ||
+ + construct<OmpInitClause::Modifier>(Parser<OmpPreferType>{})))
+@@ -1490, - "INIT" >> ...
+ + "INIT"_id >> ...
+```
+- Unparser: `flang/lib/Parser/unparse.cpp` — add printers for new preference nodes; simplify `OpenMPInteropConstruct` unparsing.
+```diff
+@@ void Unparse(const OmpPreferenceSelector &x) { FR(...) | ATTR(...) }
+@@ void Unparse(const OmpPreferenceSpecification &x) { { ... } | FR(...) }
+@@ void Unparse(const OmpPreferType &x) { Word("PREFER_TYPE"); ... }
+@@ void Unparse(const OmpInitClause &x) { Walk(modifiers, ": "); Walk(object); }
+@@ void Unparse(const OpenMPInteropConstruct &x) { Word("!$OMP "); Walk(x.v); }
+```
+- Tests: `flang/test/Semantics/omp/interop-construct.f90` — updated/added to exercise new INIT syntax (files tab reference).
+
+Pitfalls & Reviewer Notes
+- Versioning: These constructs are OpenMP 6.0; ensure version gating for diagnostics/pretty-printing when compiling with older OpenMP versions.
+- Ambiguity: Since `prefer-type` accepts general expressions, prioritize parsing `interop-type` first; mirror this ordering if extending grammar.
+- AST Consumers: Code consuming `OmpInteropPreference` must be migrated to `OmpPreferType`; verify no stale references remain.
+- Unparse Fidelity: Grouped selectors (`{...}`) vs direct FR(...) should round-trip correctly, including ATTR lists.
+
+Related Issues/PRs
+- Tracks OpenMP 6.0 interop updates and aligns INIT clause parsing.
+
+Source Code Links
+- FeatureList.cpp https://github.com/llvm/llvm-project/pull/171702/files#diff-203f376c6d62089848e43e09c7855e8106ab0cb8b01d16fa0cee14177d589b24
+- parse-tree.h https://github.com/llvm/llvm-project/pull/171702/files#diff-61d1be39226db8b7f54d3241269d9fabff009139551605546e33f6463bd4087a
+- openmp-parsers.cpp https://github.com/llvm/llvm-project/pull/171702/files#diff-fd1ab2b6d2b237c8751b438861ea7c3b2fa89ddbb703caa0d33da3a816cd124a
+- unparse.cpp https://github.com/llvm/llvm-project/pull/171702/files#diff-63a2cc1100cf54a50f48c1b5fe6d6c2ffe1cbc46e242c6ae6723f82fcd836dc1
+- dump-parse-tree.h https://github.com/llvm/llvm-project/pull/171702/files#diff-062c8b30313609d423f975d2af9ec411e4b9fffbd782216ef55155564fd7649d
+- openmp-modifiers.h https://github.com/llvm/llvm-project/pull/171702/files#diff-08b7e57d520f56ecb8269c02a02ab637524e3c5e03ac48dcdc594d0842232dbb
+- openmp-modifiers.cpp https://github.com/llvm/llvm-project/pull/171702/files#diff-08ba07f0245fe04f73ed81e9f04543b3786b276e788884bf0c82188d26b7dc5d
+
+How To Avoid Pitfalls
+- Maintain parse precedence: `interop-type` before `prefer-type`.
+- Gate unparsing/diagnostics by OpenMP version to prevent 6.0-only syntax leaks in older modes.
+- Update all semantic descriptors and feature readers to the new node names to avoid mismatches.
+
+---
+
+## Reland "[Flang][OpenMP] Add lowering support for is_device_ptr clause (#169331)"
+
+Overview
+- Purpose: Re-land Flang+MLIR support to lower `is_device_ptr` on `omp.target`, ensuring correct device-pointer semantics and runtime map flags.
+- Scope: Flang ClauseProcessor API and target lowering, MLIR OpenMP clause map flags, MLIR parser/printer, LLVM translation, and tests across Flang integration, Flang lowering, and MLIR-to-LLVM.
+
+Spec Reference
+- OpenMP target mapping semantics for `is_device_ptr`: pointer argument is treated as a device pointer; mapping flags include `TARGET_PARAM` and potentially `LITERAL` when no explicit map is present.
+
+Semantics
+- Flang: When encountering `is_device_ptr(list)`, force a map entry with flags `is_device_ptr|to` so the device-side descriptor contains the device address. Track symbols in `isDevicePtrSyms` and synthesize/augment `has_device_addr` entries as needed.
+- Flang: Duplicate the underlying `omp.map.info` so both the `is_device_ptr` clause and any synthesized `has_device_addr` user have distinct `MapInfoOp` users, preserving finalization invariants.
+- MLIR: Add `is_device_ptr` to `ClauseMapFlags`; parser/print supports `map_clauses(is_device_ptr)`.
+- LLVM Translation: Map flag conversion recognizes `is_device_ptr` and sets `OMP_MAP_TARGET_PARAM`, and when no explicit map present also sets `OMP_MAP_LITERAL`. Mark device pointer kind appropriately in collected map data.
+
+Reference
+- Implementation PR: https://github.com/llvm/llvm-project/pull/170851 (merged)
+- Summary: Enable end-to-end lowering and offload runtime mapping for `is_device_ptr`, remove previous TODO checks, and add tests.
+
+## Change Log (PR #170851)
+- Flang ClauseProcessor: `flang/lib/Lower/OpenMP/ClauseProcessor.cpp`/`.h` — extend `processIsDevicePtr` to use `StatementContext`, call `processMapObjects` with `is_device_ptr|to`, collect parent/member info, and insert synthesized child/parent map info; change call site signature.
+```diff
+@@ bool ClauseProcessor::processIsDevicePtr(
+- mlir::omp::IsDevicePtrClauseOps &result,
++ lower::StatementContext &stmtCtx, mlir::omp::IsDevicePtrClauseOps &result,
+@@
++ mlir::omp::ClauseMapFlags mapTypeBits = mlir::omp::ClauseMapFlags::is_device_ptr | mlir::omp::ClauseMapFlags::to;
++ processMapObjects(stmtCtx, location, clause.v, mapTypeBits, parentMemberIndices, result.isDevicePtrVars, isDeviceSyms);
+```
+- Flang OpenMP lowering: `flang/lib/Lower/OpenMP/OpenMP.cpp` — update clause processing order and target op generation to handle `is_device_ptr` vars, duplicate map infos, and avoid duplicate mappings.
+```diff
+@@ static void genTargetClauses(...)
+- cp.processIsDevicePtr(clauseOps, isDevicePtrSyms);
++ cp.processIsDevicePtr(stmtCtx, clauseOps, isDevicePtrSyms);
+@@ static bool isDuplicateMappedSymbol(...)
++ add isDevicePtrSyms to duplicate check list
+@@ genTargetOp(...)
++ if (!isDevicePtrSyms.empty()) { clone map info and wire synthesized has_device_addr }
+```
+- Flang Tests:
+	- `flang/test/Integration/OpenMP/map-types-and-sizes.f90` — new `mapType_is_device_ptr` subroutine and checks for sizes/maptypes arrays.
+	- `flang/test/Lower/OpenMP/target.f90` — new `omp_target_is_device_ptr` test; checks duplicated `omp.map.info` and target clause operands.
+- MLIR Enums: `mlir/include/mlir/Dialect/OpenMP/OpenMPEnums.td` — add `ClauseMapFlagsIsDevicePtr` bit and include in `ClauseMapFlags`.
+- MLIR Dialect: `mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp` — parser/print support for `is_device_ptr` map clause modifier.
+- MLIR→LLVM Translation: `mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp` — remove TODO check; translate `is_device_ptr` into `OMP_MAP_TARGET_PARAM` and conditionally `OMP_MAP_LITERAL`; mark `DevicePointers` element kind accordingly.
+- MLIR Tests: `mlir/test/Target/LLVMIR/omptarget-llvm.mlir` — add end-to-end test for `is_device_ptr`; `openmp-todo.mlir` remove obsolete expected errors.
+
+Pitfalls & Reviewer Notes
+- Map duplication: Ensure duplication occurs after the original `MapInfoOp` to keep SSA use-def and finalization passes happy.
+- Duplicate detection: Include `isDevicePtrSyms` in duplicate-mapped-symbol checks to avoid contradictory mappings.
+- Runtime flags: Only set `OMP_MAP_LITERAL` when there is no other explicit map on the operand; preserve `TARGET_PARAM` for `is_device_ptr`.
+- Interactions with `has_device_addr`: Synthesize it only if not already present to avoid redundant entries.
+
+Related Issues/PRs
+- Original change: #169331 (this PR relands it).
+
+Source Code Links
+- Flang: `ClauseProcessor.cpp` https://github.com/llvm/llvm-project/pull/170851/files#diff-55798c5090a8f8499f773b3fb46fb98a7aabe0f58ec60ff295e107acb36c7707
+- Flang: `ClauseProcessor.h` https://github.com/llvm/llvm-project/pull/170851/files#diff-68e0b910d8ab50461fbd44f967c20b09881d98da534eb78f3dc88dd254a1904b
+- Flang: `OpenMP.cpp` https://github.com/llvm/llvm-project/pull/170851/files#diff-496a295679ae3c43f8651c944a1bd9dca177ad2b5e4d7121f96938024e292bc1
+- MLIR: `OpenMPEnums.td` https://github.com/llvm/llvm-project/pull/170851/files#diff-46cd10c37bc5b882a52ea72e11c245202a338d50c6f0f5a8d31de5195f115253
+- MLIR: `OpenMPDialect.cpp` https://github.com/llvm/llvm-project/pull/170851/files#diff-a897370ad8f5ad37e8c1adb3c145c2304aaa38da3227bc1d02ac701ee8dc0754
+- MLIR: `OpenMPToLLVMIRTranslation.cpp` https://github.com/llvm/llvm-project/pull/170851/files#diff-2cbb5651f4570d81d55ac4198deda0f6f7341b2503479752ef2295da3774c586
+- Tests: `map-types-and-sizes.f90`, `target.f90`, `omptarget-llvm.mlir`, `openmp-todo.mlir`
+
+How To Avoid Pitfalls
+- Clone `MapInfoOp` users for `is_device_ptr` variables when augmenting `has_device_addr` to maintain unique user invariants.
+- Thread `isDevicePtrSyms` through duplicate mapping checks to prevent conflicting mappings.
+- Validate pointer-kind handling in translation to ensure device pointer vs address distinctions reach the runtime.
+
+---
 ## [flang][OpenMP] Implement COMBINER clause
 
 Overview
