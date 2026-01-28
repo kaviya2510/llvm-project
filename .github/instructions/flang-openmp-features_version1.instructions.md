@@ -3,7 +3,7 @@ applyTo: flang/lib/Parser/openmp*,flang/lib/Semantics/*omp*,flang/lib/Lower/Open
 ---
 
 Status
-- PRs included: 7
+- PRs included: 10
 - Last modified: 2026-01-28
 
 # OpenMP Features (Version 1 maintained to reduce the conflict with newer versions)
@@ -1159,5 +1159,635 @@ Source Code Links
 How To Avoid Pitfalls
 - Validate preconditions before transforming; when inserting splits, materialize per-team temporaries for values live across kernels.
 - Keep semantic enforcement in parser/semantics; lowering should assume verified inputs and avoid silent legalization.
+
+---
+
+## [OpenMP] Add workdistribute construct in openMP dialect and in llvm frontend
+
+Overview
+- Purpose: Introduce `omp.workdistribute` operation in the MLIR OpenMP dialect and add corresponding directive spellings in LLVM’s `OMP.td`. Provide verifier, parser/printer, and tests.
+- Scope: MLIR dialect op definition and verifier; LLVM OMP.td directive additions; dialect tests.
+
+Spec Reference
+- OpenMP 6.0 — Workdistribute: block construct nested under `teams`; structured block with specific semantics, no implicit barrier.
+
+Semantics
+- `workdistribute` divides execution of the enclosed structured block into separate units, each executed once by each initial thread in the league; must be nested directly under `teams`.
+- Region requirements: single entry, single exit (`omp.terminator`), no explicit `omp.barrier`, no nested `omp.parallel` or nested `omp.teams`.
+
+Reference
+- Implementation PR: https://github.com/llvm/llvm-project/pull/154376 (merged)
+
+## Change Log (PR #154376)
+- LLVM OpenMP Directives: `llvm/include/llvm/Frontend/OpenMP/OMP.td` — add spellings for `workdistribute`, `end workdistribute`, and combined `target teams workdistribute`/`teams workdistribute` directives.
+```diff
+@@ -1322,6 +1322,17 @@ def OMP_EndWorkshare : Directive<[Spelling<"end workshare">]> {
+	 let category = OMP_Workshare.category;
+	 let languages = [L_Fortran];
+ }
+ + def OMP_Workdistribute : Directive<[Spelling<"workdistribute">]> {
+ +   let association = AS_Block;
+ +   let category = CA_Executable;
+ +   let languages = [L_Fortran];
+ + }
+ + def OMP_EndWorkdistribute : Directive<[Spelling<"end workdistribute">]> {
+ +   let leafConstructs = OMP_Workdistribute.leafConstructs;
+ +   let association = OMP_Workdistribute.association;
+ +   let category = OMP_Workdistribute.category;
+ +   let languages = [L_Fortran];
+ + }
+@@ -2482,6 +2493,35 @@ def OMP_TargetTeamsDistributeSimd
+	 let leafConstructs = [OMP_Target, OMP_Teams, OMP_Distribute, OMP_Simd];
+	 let category = CA_Executable;
+ }
+ + def OMP_TargetTeamsWorkdistribute : Directive<[Spelling<"target teams workdistribute">]> {
+ +   let allowedClauses = [
+ +     VersionedClause<OMPC_Allocate>,
+ +     VersionedClause<OMPC_Depend>,
+ +     VersionedClause<OMPC_FirstPrivate>,
+ +     VersionedClause<OMPC_HasDeviceAddr, 51>,
+ +     VersionedClause<OMPC_If>,
+ +     VersionedClause<OMPC_IsDevicePtr>,
+ +     VersionedClause<OMPC_Map>,
+ +     VersionedClause<OMPC_OMPX_Attribute>,
+ +     VersionedClause<OMPC_Private>,
+ +     VersionedClause<OMPC_Reduction>,
+ +     VersionedClause<OMPC_Shared>,
+ +     VersionedClause<OMPC_UsesAllocators, 50>,
+ +   ];
+ +   let allowedOnceClauses = [
+ +     VersionedClause<OMPC_Default>,
+ +     VersionedClause<OMPC_DefaultMap>,
+ +     VersionedClause<OMPC_Device>,
+ +     VersionedClause<OMPC_NoWait>,
+ +     VersionedClause<OMPC_NumTeams>,
+ +     VersionedClause<OMPC_OMPX_DynCGroupMem>,
+ +     VersionedClause<OMPC_OMPX_Bare>,
+ +     VersionedClause<OMPC_ThreadLimit>,
+ +   ];
+ +   let leafConstructs = [OMP_Target, OMP_Teams, OMP_Workdistribute];
+ +   let category = CA_Executable;
+ +   let languages = [L_Fortran];
+ + }
+@@ -2723,6 +2763,25 @@ def OMP_TeamsDistributeSimd : Directive<[Spelling<"teams distribute simd">]> {
+	 let leafConstructs = [OMP_Teams, OMP_Distribute, OMP_Simd];
+	 let category = CA_Executable;
+ }
+ + def OMP_TeamsWorkdistribute : Directive<[Spelling<"teams workdistribute">]> {
+ +   let allowedClauses = [
+ +     VersionedClause<OMPC_Allocate>,
+ +     VersionedClause<OMPC_FirstPrivate>,
+ +     VersionedClause<OMPC_OMPX_Attribute>,
+ +     VersionedClause<OMPC_Private>,
+ +     VersionedClause<OMPC_Reduction>,
+ +     VersionedClause<OMPC_Shared>,
+ +   ];
+ +   let allowedOnceClauses = [
+ +     VersionedClause<OMPC_Default>,
+ +     VersionedClause<OMPC_If, 52>,
+ +     VersionedClause<OMPC_NumTeams>,
+ +     VersionedClause<OMPC_ThreadLimit>,
+ +   ];
+ +   let leafConstructs = [OMP_Teams, OMP_Workdistribute];
+ +   let category = CA_Executable;
+ +   let languages = [L_Fortran];
+ + }
+```
+- MLIR Dialect Op: `mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td` — define `WorkdistributeOp` with verifier and assembly format.
+```diff
+@@ -2209,4 +2209,27 @@ def TargetFreeMemOp : OpenMP_Op<"target_freemem",
+	 let assemblyFormat = "$device `,` $heapref attr-dict `:` type($device) `,` qualified(type($heapref))";
+ }
+   
+ + //===----------------------------------------------------------------------===//
+ + // workdistribute Construct
+ + //===----------------------------------------------------------------------===//
+ +
+ + def WorkdistributeOp : OpenMP_Op<"workdistribute"> {
+ +   let summary = "workdistribute directive";
+ +   let description = [{
+ +     workdistribute divides execution of the enclosed structured block into
+ +     separate units of work, each executed only once by each
+ +     initial thread in the league.
+ +     ```
+ +     !$omp target teams
+ +     !$omp workdistribute
+ +     y = a * x + y  
+ +     !$omp end workdistribute
+ +     !$omp end target teams
+ +     ```
+ +   }];
+ +   let regions = (region AnyRegion:$region);
+ +   let hasVerifier = 1;
+ +   let assemblyFormat = "$region attr-dict";
+ + }
+@@ -2212,2235 @@ #endif // OPENMP_OPS
+```
+- MLIR Verifier: `mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp` — implement `WorkdistributeOp::verify` with nesting and region checks.
+```diff
+@@ -3975,6 +3975,58 @@ llvm::LogicalResult omp::TargetAllocMemOp::verify() {
+	 return mlir::success();
+ }
+   
+ + //===----------------------------------------------------------------------===//
+ + // WorkdistributeOp
+ + //===----------------------------------------------------------------------===//
+ +
+ + LogicalResult WorkdistributeOp::verify() {
+ +   // Check that region exists and is not empty
+ +   Region &region = getRegion();
+ +   if (region.empty())
+ +     return emitOpError("region cannot be empty");
+ +   // Verify single entry point.
+ +   Block &entryBlock = region.front();
+ +   if (entryBlock.empty())
+ +     return emitOpError("region must contain a structured block");
+ +   // Verify single exit point.
+ +   bool hasTerminator = false;
+ +   for (Block &block : region) {
+ +     if (isa<TerminatorOp>(block.back())) {
+ +       if (hasTerminator) {
+ +         return emitOpError("region must have exactly one terminator");
+ +       }
+ +       hasTerminator = true;
+ +     }
+ +   }
+ +   if (!hasTerminator) {
+ +     return emitOpError("region must be terminated with omp.terminator");
+ +   }
+ +   auto walkResult = region.walk([&](Operation *op) -> WalkResult {
+ +     // No implicit barrier at end
+ +     if (isa<BarrierOp>(op)) {
+ +       return emitOpError(
+ +           "explicit barriers are not allowed in workdistribute region");
+ +     }
+ +     // Check for invalid nested constructs
+ +     if (isa<ParallelOp>(op)) {
+ +       return emitOpError(
+ +           "nested parallel constructs not allowed in workdistribute");
+ +     }
+ +     if (isa<TeamsOp>(op)) {
+ +       return emitOpError(
+ +           "nested teams constructs not allowed in workdistribute");
+ +     }
+ +     return WalkResult::advance();
+ +   });
+ +   if (walkResult.wasInterrupted())
+ +     return failure();
+ +
+ +   Operation *parentOp = (*this)->getParentOp();
+ +   if (!llvm::dyn_cast<TeamsOp>(parentOp))
+ +     return emitOpError("workdistribute must be nested under teams");
+ +   return success();
+ + }
+```
+- MLIR Tests (invalid): `mlir/test/Dialect/OpenMP/invalid.mlir` — add error cases for empty region, missing terminator, multiple terminators, barriers, nested parallel/teams, and missing teams nesting.
+```diff
+@@ -3017,3 +3119,110 @@ func.func @invalid_allocate_allocator(%arg0 : memref<i32>) -> () {
+	 return
+ }
+ +
+ + // -----
+ + func.func @invalid_workdistribute_empty_region() -> () {
+ +   omp.teams {
+ +     // expected-error @below {{region cannot be empty}}
+ +     omp.workdistribute {
+ +     }
+ +     omp.terminator
+ +   }
+ +   return
+ + }
+ +
+ + // -----
+ + func.func @invalid_workdistribute_no_terminator() -> () {
+ +   omp.teams {
+ +     // expected-error @below {{region must be terminated with omp.terminator}}
+ +     omp.workdistribute {
+ +       %c0 = arith.constant 0 : i32
+ +     }
+ +     omp.terminator
+ +   }
+ +   return
+ + }
+ +
+ + // -----
+ + func.func @invalid_workdistribute_wrong_terminator() -> () {
+ +   omp.teams {
+ +     // expected-error @below {{region must be terminated with omp.terminator}}
+ +     omp.workdistribute {
+ +       %c0 = arith.constant 0 : i32
+ +       func.return
+ +     }
+ +     omp.terminator
+ +   }
+ +   return
+ + }
+ +
+ + // -----
+ + func.func @invalid_workdistribute_multiple_terminators() -> () {
+ +   omp.teams {
+ +     // expected-error @below {{region must have exactly one terminator}}
+ +     omp.workdistribute {
+ +       %cond = arith.constant true
+ +       cf.cond_br %cond, ^bb1, ^bb2
+ +       ^bb1:
+ +       omp.terminator
+ +       ^bb2:
+ +       omp.terminator
+ +     }
+ +     omp.terminator
+ +   }
+ +   return
+ + }
+ +
+ + // -----
+ + func.func @invalid_workdistribute_with_barrier() -> () {
+ +   omp.teams {
+ +     // expected-error @below {{explicit barriers are not allowed in workdistribute region}}
+ +     omp.workdistribute {
+ +       %c0 = arith.constant 0 : i32
+ +       omp.barrier
+ +       omp.terminator
+ +     }
+ +     omp.terminator
+ +   }
+ +   return
+ + }
+ +
+ + // -----
+ + func.func @invalid_workdistribute_nested_parallel() -> () {
+ +   omp.teams {
+ +     // expected-error @below {{nested parallel constructs not allowed in workdistribute}}
+ +     omp.workdistribute {
+ +       omp.parallel {
+ +         omp.terminator
+ +       }
+ +       omp.terminator
+ +     }
+ +     omp.terminator
+ +   }
+ +   return
+ + }
+ +
+ + // Test: nested teams not allowed in workdistribute
+ + func.func @invalid_workdistribute_nested_teams() -> () {
+ +   omp.teams {
+ +     // expected-error @below {{nested teams constructs not allowed in workdistribute}}
+ +     omp.workdistribute {
+ +       omp.teams {
+ +         omp.terminator
+ +       }
+ +       omp.terminator
+ +     }
+ +     omp.terminator
+ +   }
+ +   return
+ + }
+ +
+ + // -----
+ + func.func @invalid_workdistribute() -> () {
+ +   // expected-error @below {{workdistribute must be nested under teams}}
+ +   omp.workdistribute {
+ +     omp.terminator
+ +   }
+ +   return
+ + }
+```
+- MLIR Tests (ops): `mlir/test/Dialect/OpenMP/ops.mlir` — add positive construction under teams.
+```diff
+@@ -3238,3 +3252,15 @@ func.func @omp_allocate_dir(%arg0 : memref<i32>, %arg1 : memref<i32>) -> () {
+	 return
+ }
+ +
+ + // CHECK-LABEL: func.func @omp_workdistribute
+ + func.func @omp_workdistribute() {
+ +   // CHECK: omp.teams
+ +   omp.teams {
+ +     // CHECK: omp.workdistribute
+ +     omp.workdistribute {
+ +       omp.terminator
+ +     }
+ +     omp.terminator
+ +   }
+ +   return
+ + }
+```
+
+Pitfalls & Reviewer Notes
+- Ensure verifier enforces all region properties and teams nesting; tests cover common violations.
+- Keep dialect printer/parser synchronized with ODS; assembly format is region-only.
+- Directive spellings added only for Fortran in `OMP.td` per scope.
+
+Related Links
+- OpenMP 6.0 Workdistribute definition and nesting constraints.
+
+---
+
+## [flang][openmp] Add parser/semantic support for workdistribute
+
+Overview
+- Purpose: Parse OpenMP 6.0 `WORKDISTRIBUTE` (and combined `TEAMS WORKDISTRIBUTE`, `TARGET TEAMS WORKDISTRIBUTE`) and enforce structure rules: nesting under TEAMS only; body is assignment-only; version gating (requires -fopenmp-version=60).
+- Scope: Parser (`openmp-parsers.cpp`), directive sets (`openmp-directive-sets.h`), semantics structure checks (`check-omp-structure.cpp/.h`, `resolve-directives.cpp`), and tests.
+
+Spec Reference
+- OpenMP 6.0 — `workdistribute` block construct semantics and constraints.
+
+Reference
+- Implementation PR: https://github.com/llvm/llvm-project/pull/154377 (merged)
+
+## Change Log (PR #154377)
+- Directive Sets: `flang/include/flang/Semantics/openmp-directive-sets.h` — include new directives in target/teams sets and block construct set; allow nested teams to contain `workdistribute`.
+```diff
+@@ -143,6 +143,7 @@ static const OmpDirectiveSet topTargetSet{
+	 Directive::OMPD_target_teams_distribute_parallel_do_simd,
+	 Directive::OMPD_target_teams_distribute_simd,
+	 Directive::OMPD_target_teams_loop,
+ + Directive::OMPD_target_teams_workdistribute,
+ };
+@@ -172,6 +173,7 @@ static const OmpDirectiveSet topTeamsSet{
+	 Directive::OMPD_teams_distribute_parallel_do_simd,
+	 Directive::OMPD_teams_distribute_simd,
+	 Directive::OMPD_teams_loop,
+ + Directive::OMPD_teams_workdistribute,
+ };
+@@ -187,6 +189,7 @@ static const OmpDirectiveSet allTeamsSet{
+	 Directive::OMPD_target_teams_distribute_parallel_do_simd,
+	 Directive::OMPD_target_teams_distribute_simd,
+	 Directive::OMPD_target_teams_loop,
+ + Directive::OMPD_target_teams_workdistribute,
+ } | topTeamsSet,
+@@ -230,6 +233,9 @@ static const OmpDirectiveSet blockConstructSet{
+	 Directive::OMPD_taskgroup,
+	 Directive::OMPD_teams,
+	 Directive::OMPD_workshare,
+ + Directive::OMPD_target_teams_workdistribute,
+ + Directive::OMPD_teams_workdistribute,
+ + Directive::OMPD_workdistribute,
+ };
+@@ -376,6 +382,7 @@ static const OmpDirectiveSet nestedReduceWorkshareAllowedSet{
+ };
+@@ -378,384 | static const OmpDirectiveSet nestedTeamsAllowedSet{
+ + Directive::OMPD_workdistribute,
+	 Directive::OMPD_distribute,
+	 Directive::OMPD_distribute_parallel_do,
+	 Directive::OMPD_distribute_parallel_do_simd,
+ }
+```
+- Parser: `flang/lib/Parser/openmp-parsers.cpp` — add block construct productions for `target teams workdistribute`, `teams workdistribute`, and `workdistribute`.
+```diff
+@@ -1870,11 +1870,15 @@ TYPE_PARSER( //
+	 MakeBlockConstruct(llvm::omp::Directive::OMPD_target_data) ||
+	 MakeBlockConstruct(llvm::omp::Directive::OMPD_target_parallel) ||
+	 MakeBlockConstruct(llvm::omp::Directive::OMPD_target_teams) ||
+ + MakeBlockConstruct(
+ +   llvm::omp::Directive::OMPD_target_teams_workdistribute) ||
+	 MakeBlockConstruct(llvm::omp::Directive::OMPD_target) ||
+	 MakeBlockConstruct(llvm::omp::Directive::OMPD_task) ||
+	 MakeBlockConstruct(llvm::omp::Directive::OMPD_taskgroup) ||
+	 MakeBlockConstruct(llvm::omp::Directive::OMPD_teams) ||
+ - MakeBlockConstruct(llvm::omp::Directive::OMPD_workshare))
+ + MakeBlockConstruct(llvm::omp::Directive::OMPD_teams_workdistribute) ||
+ + MakeBlockConstruct(llvm::omp::Directive::OMPD_workshare) ||
+ + MakeBlockConstruct(llvm::omp::Directive::OMPD_workdistribute))
+ #undef MakeBlockConstruct
+```
+- Semantics Structure: `flang/lib/Semantics/check-omp-structure.cpp` — add checks for teams-only nesting and assignment-only body; gate by OpenMP version.
+```diff
+@@ -815,6 +873,12 @@ void OmpStructureChecker::Enter(const parser::OpenMPBlockConstruct &x) {
+	 "TARGET construct with nested TEAMS region contains statements or "
+	 "directives outside of the TEAMS construct"_err_en_US);
+ }
+ + if (GetContext().directive == llvm::omp::Directive::OMPD_workdistribute &&
+ +     GetContextParent().directive != llvm::omp::Directive::OMPD_teams) {
+ +   context_.Say(x.BeginDir().DirName().source,
+ +     "%s region can only be strictly nested within TEAMS region"_err_en_US,
+ +     ContextDirectiveAsFortran());
+ + }
+@@ -898,6 +962,17 @@ void OmpStructureChecker::Enter(const parser::OpenMPBlockConstruct &x) {
+	 HasInvalidWorksharingNesting(
+	 beginSpec.source, llvm::omp::nestedWorkshareErrSet);
+	 break;
+ + case llvm::omp::OMPD_workdistribute:
+ +   if (!CurrentDirectiveIsNested()) {
+ +     context_.Say(beginSpec.source,
+ +       "A WORKDISTRIBUTE region must be nested inside TEAMS region only."_err_en_US);
+ +   }
+ +   CheckWorkdistributeBlockStmts(block, beginSpec.source);
+ +   break;
+ + case llvm::omp::OMPD_teams_workdistribute:
+ + case llvm::omp::OMPD_target_teams_workdistribute:
+ +   CheckWorkdistributeBlockStmts(block, beginSpec.source);
+ +   break;
+```
+- Semantics Helpers: `flang/lib/Semantics/check-omp-structure.h` — declare helper.
+```diff
+@@ -245,6 +245,7 @@ class OmpStructureChecker
+	 bool CheckTargetBlockOnlyTeams(const parser::Block &);
+	 void CheckWorkshareBlockStmts(const parser::Block &, parser::CharBlock);
+ + void CheckWorkdistributeBlockStmts(const parser::Block &, parser::CharBlock);
+```
+- Semantics Helpers impl: `flang/lib/Semantics/check-omp-structure.cpp` — implement version gate and assignment-only enforcement.
+```diff
+@@ -4546,6 +4621,27 @@ void OmpStructureChecker::CheckWorkshareBlockStmts(
+ }
+ 
+ + void OmpStructureChecker::CheckWorkdistributeBlockStmts(
+ +     const parser::Block &block, parser::CharBlock source) {
+ +   unsigned version{context_.langOptions().OpenMPVersion};
+ +   unsigned since{60};
+ +   if (version < since)
+ +     context_.Say(source,
+ +       "WORKDISTRIBUTE construct is not allowed in %s, %s"_err_en_US,
+ +       ThisVersion(version), TryVersion(since));
+ +
+ +   OmpWorkdistributeBlockChecker ompWorkdistributeBlockChecker{context_, source};
+ +
+ +   for (auto it{block.begin()}; it != block.end(); ++it) {
+ +     if (parser::Unwrap<parser::AssignmentStmt>(*it)) {
+ +       parser::Walk(*it, ompWorkdistributeBlockChecker);
+ +     } else {
+ +       context_.Say(source,
+ +         "The structured block in a WORKDISTRIBUTE construct may consist of only SCALAR or ARRAY assignments"_err_en_US);
+ +     }
+ +   }
+ + }
+```
+- Resolve/Context: `flang/lib/Semantics/resolve-directives.cpp` — push/pop context for workdistribute variants.
+```diff
+@@ -1740,10 +1740,13 @@ bool OmpAttributeVisitor::Pre(const parser::OpenMPBlockConstruct &x) {
+	 case llvm::omp::Directive::OMPD_task:
+	 case llvm::omp::Directive::OMPD_taskgroup:
+	 case llvm::omp::Directive::OMPD_teams:
+ + case llvm::omp::Directive::OMPD_workdistribute:
+	 case llvm::omp::Directive::OMPD_workshare:
+	 case llvm::omp::Directive::OMPD_parallel_workshare:
+	 case llvm::omp::Directive::OMPD_target_teams:
+ + case llvm::omp::Directive::OMPD_target_teams_workdistribute:
+	 case llvm::omp::Directive::OMPD_target_parallel:
+ + case llvm::omp::Directive::OMPD_teams_workdistribute: {
+	 PushContext(dirSpec.source, dirId);
+	 break;
+ }
+@@ -1773,9 +1776,12 @@ void OmpAttributeVisitor::Post(const parser::OpenMPBlockConstruct &x) {
+	 case llvm::omp::Directive::OMPD_target:
+	 case llvm::omp::Directive::OMPD_task:
+	 case llvm::omp::Directive::OMPD_teams:
+ + case llvm::omp::Directive::OMPD_workdistribute:
+	 case llvm::omp::Directive::OMPD_parallel_workshare:
+	 case llvm::omp::Directive::OMPD_target_teams:
+ - case llvm::omp::Directive::OMPD_target_parallel: {
+ + case llvm::omp::Directive::OMPD_target_parallel:
+ + case llvm::omp::Directive::OMPD_target_teams_workdistribute:
+ + case llvm::omp::Directive::OMPD_teams_workdistribute: {
+	 bool hasPrivate;
+	 for (const auto *allocName : allocateNames_) {
+		 hasPrivate = false;
+```
+- Parser/Semantics Tests: add parsing/unparsing and error tests.
+```diff
+@@ -0,0 +27 @@ flang/test/Parser/OpenMP/workdistribute.f90
+ + !RUN: %flang_fc1 -fdebug-unparse -fopenmp -fopenmp-version=60 %s | FileCheck --ignore-case --check-prefix="UNPARSE" %s
+ + !RUN: %flang_fc1 -fdebug-dump-parse-tree -fopenmp -fopenmp-version=60 %s | FileCheck --check-prefix="PARSE-TREE" %s
+ +
+ + !UNPARSE: !$OMP TEAMS WORKDISTRIBUTE
+ + !PARSE-TREE: OmpDirectiveName -> llvm::omp::Directive = teams workdistribute
+ + !$omp teams workdistribute
+ + y = a * x + y
+ + !$omp end teams workdistribute
+```
+```diff
+@@ -0,0 +16 @@ flang/test/Semantics/OpenMP/workdistribute01.f90
+ + !ERROR: A WORKDISTRIBUTE region must be nested inside TEAMS region only.
+ + !ERROR: The structured block in a WORKDISTRIBUTE construct may consist of only SCALAR or ARRAY assignments
+ + !$omp workdistribute
+ + do i = 1, n
+ +   print *, "omp workdistribute"
+ + end do
+ + !$omp end workdistribute
+```
+```diff
+@@ -0,0 +34 @@ flang/test/Semantics/OpenMP/workdistribute02.f90
+ + !ERROR: User defined non-ELEMENTAL function 'my_func' is not allowed in a WORKDISTRIBUTE construct
+ + !$omp teams
+ + !$omp workdistribute
+ + aa = my_func()
+ + aa = bb * cc
+ + !$omp end workdistribute
+ + !$omp end teams
+```
+```diff
+@@ -0,0 +34 @@ flang/test/Semantics/OpenMP/workdistribute03.f90
+ + !ERROR: Defined assignment statement is not allowed in a WORKDISTRIBUTE construct
+ + !$omp teams
+ + !$omp workdistribute
+ + a = l
+ + aa = bb
+ + !$omp end workdistribute
+ + !$omp end teams
+```
+```diff
+@@ -0,0 +15 @@ flang/test/Semantics/OpenMP/workdistribute04.f90
+ + ! RUN: %python %S/../test_errors.py %s %flang -fopenmp -fopenmp-version=50
+ + !ERROR: WORKDISTRIBUTE construct is not allowed in OpenMP v5.0, try -fopenmp-version=60
+ + !$omp teams workdistribute
+ + y = a * x + y
+ + !$omp end teams workdistribute
+```
+
+Pitfalls & Reviewer Notes
+- Body restriction: Only scalar/array assignments allowed; defined assignments and non-elemental/impure functions diagnosed.
+- Version gating: Emit diagnostic when compiling with OpenMP < 6.0.
+- Nesting: Enforce TEAMS-only nesting for standalone WORKDISTRIBUTE.
+
+---
+
+## [flang][openmp] Add Lowering to omp mlir for workdistribute construct
+
+Overview
+- Purpose: Lower the parsed `WORKDISTRIBUTE` constructs to MLIR `omp.workdistribute`, and handle composite forms `TEAMS WORKDISTRIBUTE` / `TARGET TEAMS WORKDISTRIBUTE` by processing team clauses.
+- Scope: Flang lowering in `OpenMP.cpp` and tests.
+
+Reference
+- Implementation PR: https://github.com/llvm/llvm-project/pull/154378 (merged)
+
+## Change Log (PR #154378)
+- Flang Lowering: `flang/lib/Lower/OpenMP/OpenMP.cpp` — dispatch and generation helpers for `workdistribute` and composite forms.
+```diff
+@@ -534,6 +543,13 @@ static void processHostEvalClauses(lower::AbstractConverter &converter,
+	 cp.processCollapse(loc, eval, hostInfo->ops, hostInfo->iv);
+	 break;
+ 
+ + case OMPD_teams_workdistribute:
+ +   cp.processThreadLimit(stmtCtx, hostInfo->ops);
+ +   [[fallthrough]];
+ + case OMPD_target_teams_workdistribute:
+ +   cp.processNumTeams(stmtCtx, hostInfo->ops);
+ +   break;
+```
+```diff
+@@ -2820,6 +2827,17 @@ genTeamsOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+ }
+ 
+ + static mlir::omp::WorkdistributeOp genWorkdistributeOp(
+ +     lower::AbstractConverter &converter, lower::SymMap &symTable,
+ +     semantics::SemanticsContext &semaCtx, lower::pft::Evaluation &eval,
+ +     mlir::Location loc, const ConstructQueue &queue,
+ +     ConstructQueue::const_iterator item) {
+ +   return genOpWithBody<mlir::omp::WorkdistributeOp>(
+ +       OpWithBodyGenInfo(converter, symTable, semaCtx, loc, eval,
+ +                         llvm::omp::Directive::OMPD_workdistribute),
+ +       queue, item);
+ + }
+```
+```diff
+@@ -3459,7 +3477,10 @@ static void genOMPDispatch(lower::AbstractConverter &converter,
+	 case llvm::omp::Directive::OMPD_unroll:
+		 genUnrollOp(converter, symTable, stmtCtx, semaCtx, eval, loc, queue, item);
+		 break;
+ - // case llvm::omp::Directive::OMPD_workdistribute:
+ + case llvm::omp::Directive::OMPD_workdistribute:
+ +   newOp = genWorkdistributeOp(converter, symTable, semaCtx, eval, loc, queue,
+ +                               item);
+ +   break;
+	 case llvm::omp::Directive::OMPD_workshare:
+```
+- Flang Lowering Tests: `flang/test/Lower/OpenMP/workdistribute.f90` — ensure lowering emits `omp.workdistribute` under `omp.teams`, and in composite form under `omp.target`.
+```diff
+@@ -0,0 +30 @@
+ + ! RUN: %flang_fc1 -emit-hlfir -fopenmp -fopenmp-version=60 %s -o - | FileCheck %s
+ +
+ + ! CHECK-LABEL: func @_QPtarget_teams_workdistribute
+ + subroutine target_teams_workdistribute()
+ +   integer :: aa(10), bb(10)
+ +   ! CHECK: omp.target
+ +   ! CHECK: omp.teams
+ +   ! CHECK: omp.workdistribute
+ +   !$omp target teams workdistribute
+ +   aa = bb
+ +   ! CHECK: omp.terminator
+ +   ! CHECK: omp.terminator
+ +   ! CHECK: omp.terminator
+ +   !$omp end target teams workdistribute
+ + end subroutine target_teams_workdistribute
+ +
+ + ! CHECK-LABEL: func @_QPteams_workdistribute
+ + subroutine teams_workdistribute()
+ +   use iso_fortran_env
+ +   real(kind=real32) :: a
+ +   real(kind=real32), dimension(10) :: x
+ +   real(kind=real32), dimension(10) :: y
+ +   ! CHECK: omp.teams
+ +   ! CHECK: omp.workdistribute
+ +   !$omp teams workdistribute
+ +   y = a * x + y
+ +   ! CHECK: omp.terminator
+ +   ! CHECK: omp.terminator
+ +   !$omp end teams workdistribute
+ + end subroutine teams_workdistribute
+```
+
+Pitfalls & Reviewer Notes
+- Ensure clause processing for `num_teams`/`thread_limit` is triggered for composite forms.
+- Lowering uses `genOpWithBody` shared infra; confirm region body generation and terminators.
 
 ---
