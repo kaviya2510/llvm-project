@@ -3,7 +3,7 @@ applyTo: flang/lib/Parser/openmp*,flang/lib/Semantics/*omp*,flang/lib/Lower/Open
 ---
 
 Status
-- PRs included: 10
+- PRs included: 11
 - Last modified: 2026-01-28
 
 # OpenMP Features (Version 1 maintained to reduce the conflict with newer versions)
@@ -11,6 +11,435 @@ Status
 # PART 1: REFERENCE FEATURE IMPLEMENTATION DATABASE
 
 This section contains a reference database of OpenMP features that are implemented in the Flang/LLVM/MLIR toolchain. Each feature is listed with its corresponding OpenMP version, description, and implementation status.
+
+---
+
+## [MLIR][OpenMP] Add a new AutomapToTargetData conversion pass in FIR
+
+Overview
+- Purpose: Automatically insert `omp.target_enter_data` and `omp.target_exit_data` operations for variables marked with `AUTOMAP` in `declare target`, when their allocation/deallocation is detected in FIR, ensuring device mapping lifetimes follow host-side allocation.
+- Scope: New FIR OpenMP pass, shared OpenMP utilities, pass pipeline wiring, and tests (FIR transform + offload integration).
+
+Spec Reference
+- OpenMP `declare target` with implementation-defined `AUTOMAP` modifier semantics; device mapping follows host allocation/deallocation.
+
+Semantics
+- Detect global variables with `declare target automap=true` and non-host device types.
+- When allocation (`fir.allocmem` → `fir.embox` → stored to declared global) occurs, insert `omp.target_enter_data` with a `map(to: ...)` entry and bounds.
+- When deallocation (`fir.load` → `fir.box_addr` → `fir.freemem`) occurs, insert `omp.target_exit_data` with a `map(delete: ...)` entry.
+- Generate `omp.map.bounds` for dynamically-sized variables using shared utilities; capture kind is `ByCopy` and mapper id/device symbol are preserved.
+- Wire the pass into the OpenMP FIR pipeline before `MapInfoFinalizationPass` so newly created `MapInfoOp` instances are finalized correctly.
+
+Reference
+- Implementation PR: https://github.com/llvm/llvm-project/pull/153048 (merged)
+- Summary: Introduces `AutomapToTargetData` pass, factors bounds utilities into `OpenMP-utils.h`, adds pipeline hook and tests.
+
+## Change Log (PR #153048)
+- **Pass registration:** `flang/include/flang/Optimizer/OpenMP/Passes.td` — define `AutomapToTargetDataPass` with summary/description and dependent dialects.
+```diff
+@@ -112,4 +112,15 @@ def GenericLoopConversionPass |
+	]; |
+ } |
+	 |
++ def AutomapToTargetDataPass |
++ : Pass<"omp-automap-to-target-data", "::mlir::ModuleOp"> { |
++ let summary = "Insert OpenMP target data operations for AUTOMAP variables"; |
++ let description = [{ |
++ Inserts `omp.target_enter_data` and `omp.target_exit_data` operations to |
++ map variables marked with the `AUTOMAP` modifier when their allocation |
++ or deallocation is detected in the FIR. |
++ }]; |
++ let dependentDialects = ["mlir::omp::OpenMPDialect"]; |
++ } |
++  |
+ #endif //FORTRAN_OPTIMIZER_OPENMP_PASSES
+```
+- **Shared utilities:** `flang/include/flang/Support/OpenMP-utils.h` — add headers and helpers to compute bounds and generate `omp.map.bounds` ops.
+```diff
+@@ -9,8 +9,13 @@ |
+ #ifndef FORTRAN_SUPPORT_OPENMP_UTILS_H_ |
+ #define FORTRAN_SUPPORT_OPENMP_UTILS_H_ |
+	 |
++ #include "flang/Optimizer/Builder/DirectivesCommon.h" |
++ #include "flang/Optimizer/Builder/FIRBuilder.h" |
++ #include "flang/Optimizer/Builder/HLFIRTools.h" |
++ #include "flang/Optimizer/Dialect/FIRType.h" |
+ #include "flang/Semantics/symbol.h" |
+	 |
++ #include "mlir/Dialect/OpenMP/OpenMPDialect.h" |
+@@ -72,6 +77,35 @@ struct EntryBlockArgs { |
+ /// \param [in] region - Empty region in which to create the entry block. |
+ mlir::Block *genEntryBlock( |
+	mlir::OpBuilder &builder, const EntryBlockArgs &args, mlir::Region &region); |
++  |
++ // Returns true if the variable has a dynamic size and therefore requires |
++ // bounds operations to describe its extents. |
++ inline bool needsBoundsOps(mlir::Value var) { |
++  assert(mlir::isa<mlir::omp::PointerLikeType>(var.getType()) && |
++  "only pointer like types expected"); |
++  mlir::Type t = fir::unwrapRefType(var.getType()); |
++  if (mlir::Type inner = fir::dyn_cast_ptrOrBoxEleTy(t)) |
++   return fir::hasDynamicSize(inner); |
++  return fir::hasDynamicSize(t); |
++ } |
++  |
++ // Generate MapBoundsOp operations for the variable if required. |
++ inline void genBoundsOps(fir::FirOpBuilder &builder, mlir::Value var, |
++  llvm::SmallVectorImpl<mlir::Value> &boundsOps) { |
++  mlir::Location loc = var.getLoc(); |
++  fir::factory::AddrAndBoundsInfo info = |
++   fir::factory::getDataOperandBaseAddr(builder, var, |
++   /*isOptional=*/false, loc); |
++  fir::ExtendedValue exv = |
++   hlfir::translateToExtendedValue(loc, builder, hlfir::Entity{info.addr}, |
++   /*contiguousHint=*/true) |
++   .first; |
++  llvm::SmallVector<mlir::Value> tmp = |
++   fir::factory::genImplicitBoundsOps<mlir::omp::MapBoundsOp, |
++   mlir::omp::MapBoundsType>( |
++   builder, info, exv, /*dataExvIsAssumedSize=*/false, loc); |
++  llvm::append_range(boundsOps, tmp); |
++ } |
+ } // namespace Fortran::common::openmp |
+	 |
+ #endif // FORTRAN_SUPPORT_OPENMP_UTILS_H_
+```
+- **New pass implementation:** `flang/lib/Optimizer/OpenMP/AutomapToTargetData.cpp` — implement detection of alloc/free sequences and insertion of `target_enter_data`/`target_exit_data` with `map.info` and bounds.
+```diff
+@@ -0,0 +1,130 @@
++//===- AutomapToTargetData.cpp -------------------------------------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#include "flang/Optimizer/Builder/FIRBuilder.h"
++#include "flang/Optimizer/Builder/HLFIRTools.h"
++#include "flang/Optimizer/Dialect/FIROps.h"
++#include "flang/Optimizer/Dialect/FIRType.h"
++#include "flang/Optimizer/Dialect/Support/KindMapping.h"
++#include "flang/Optimizer/HLFIR/HLFIROps.h"
++#include "flang/Support/OpenMP-utils.h"
++
++#include "mlir/Dialect/OpenMP/OpenMPDialect.h"
++#include "mlir/Dialect/OpenMP/OpenMPInterfaces.h"
++#include "mlir/IR/BuiltinAttributes.h"
++#include "mlir/IR/Operation.h"
++#include "mlir/Pass/Pass.h"
++
++#include "llvm/Frontend/OpenMP/OMPConstants.h"
++
++namespace flangomp {
++#define GEN_PASS_DEF_AUTOMAPTOTARGETDATAPASS
++#include "flang/Optimizer/OpenMP/Passes.h.inc"
++} // namespace flangomp
++
++using namespace mlir;
++using namespace Fortran::common::openmp;
++
++namespace {
++class AutomapToTargetDataPass
++ : public flangomp::impl::AutomapToTargetDataPassBase<
++ AutomapToTargetDataPass> {
++  void findRelatedAllocmemFreemem(fir::AddrOfOp addressOfOp,
++   llvm::DenseSet<fir::StoreOp> &allocmems,
++   llvm::DenseSet<fir::LoadOp> &freemems) {
++   assert(addressOfOp->hasOneUse() && "op must have single use");
++
++   auto declaredRef =
++   cast<hlfir::DeclareOp>(*addressOfOp->getUsers().begin())->getResult(0);
++
++   for (Operation *refUser : declaredRef.getUsers()) {
++    if (auto storeOp = dyn_cast<fir::StoreOp>(refUser))
++     if (auto emboxOp = storeOp.getValue().getDefiningOp<fir::EmboxOp>())
++      if (auto allocmemOp =
++       emboxOp.getOperand(0).getDefiningOp<fir::AllocMemOp>())
++       allocmems.insert(storeOp);
++
++    if (auto loadOp = dyn_cast<fir::LoadOp>(refUser))
++     for (Operation *loadUser : loadOp.getResult().getUsers())
++      if (auto boxAddrOp = dyn_cast<fir::BoxAddrOp>(loadUser))
++       for (Operation *boxAddrUser : boxAddrOp.getResult().getUsers())
++        if (auto freememOp = dyn_cast<fir::FreeMemOp>(boxAddrUser))
++         freemems.insert(loadOp);
++   }
++  }
++
++  void runOnOperation() override {
++   ModuleOp module = getOperation()->getParentOfType<ModuleOp>();
++   if (!module)
++    module = dyn_cast<ModuleOp>(getOperation());
++   if (!module)
++    return;
++
++   // Build FIR builder for helper utilities.
++   fir::KindMapping kindMap = fir::getKindMapping(module);
++   fir::FirOpBuilder builder{module, std::move(kindMap)};
++
++   // Collect global variables with AUTOMAP flag.
++   llvm::DenseSet<fir::GlobalOp> automapGlobals;
++   module.walk([&](fir::GlobalOp globalOp) {
++    if (auto iface =
++     dyn_cast<omp::DeclareTargetInterface>(globalOp.getOperation()))
++     if (iface.isDeclareTarget() && iface.getDeclareTargetAutomap() &&
++      iface.getDeclareTargetDeviceType() !=
++      omp::DeclareTargetDeviceType::host)
++      automapGlobals.insert(globalOp);
++   });
++
++   auto addMapInfo = [&](auto globalOp, auto memOp) {
++    builder.setInsertionPointAfter(memOp);
++    SmallVector<Value> bounds;
++    if (needsBoundsOps(memOp.getMemref()))
++     genBoundsOps(builder, memOp.getMemref(), bounds);
++
++    omp::TargetEnterExitUpdateDataOperands clauses;
++    mlir::omp::MapInfoOp mapInfo = mlir::omp::MapInfoOp::create(
++     builder, memOp.getLoc(), memOp.getMemref().getType(),
++     memOp.getMemref(),
++     TypeAttr::get(fir::unwrapRefType(memOp.getMemref().getType())),
++     builder.getIntegerAttr(
++      builder.getIntegerType(64, false),
++      static_cast<unsigned>(
++       isa<fir::StoreOp>(memOp)
++       ? llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_TO
++       : llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_DELETE)),
++     builder.getAttr<omp::VariableCaptureKindAttr>(
++      omp::VariableCaptureKind::ByCopy),
++     /*var_ptr_ptr=*/mlir::Value{},
++     /*members=*/SmallVector<Value>{},
++     /*members_index=*/ArrayAttr{}, bounds,
++     /*mapperId=*/mlir::FlatSymbolRefAttr(), globalOp.getSymNameAttr(),
++     builder.getBoolAttr(false));
++    clauses.mapVars.push_back(mapInfo);
++    isa<fir::StoreOp>(memOp)
++     ? builder.create<omp::TargetEnterDataOp>(memOp.getLoc(), clauses)
++     : builder.create<omp::TargetExitDataOp>(memOp.getLoc(), clauses);
++   };
++
++   for (fir::GlobalOp globalOp : automapGlobals) {
++    if (auto uses = globalOp.getSymbolUses(module.getOperation())) {
++     llvm::DenseSet<fir::StoreOp> allocmemStores;
++     llvm::DenseSet<fir::LoadOp> freememLoads;
++     for (auto &x : *uses)
++      if (auto addrOp = dyn_cast<fir::AddrOfOp>(x.getUser()))
++       findRelatedAllocmemFreemem(addrOp, allocmemStores, freememLoads);
++
++     for (auto storeOp : allocmemStores)
++      addMapInfo(globalOp, storeOp);
++
++     for (auto loadOp : freememLoads)
++      addMapInfo(globalOp, loadOp);
++    }
++   }
++  }
++ };
++} // namespace
+```
+- **Build:** `flang/lib/Optimizer/OpenMP/CMakeLists.txt` — add the new pass source.
+```diff
+@@ -1,6 +1,7 @@
+ get_property(dialect_libs GLOBAL PROPERTY MLIR_DIALECT_LIBS)
+   
+ add_flang_library(FlangOpenMPTransforms |
++ AutomapToTargetData.cpp |
+	DoConcurrentConversion.cpp |
+	FunctionFiltering.cpp |
+	GenericLoopConversion.cpp |
+```
+- **Refactor utils:** `flang/lib/Optimizer/OpenMP/MapsForPrivatizedSymbols.cpp` — include utilities header and drop local bounds helpers.
+```diff
+@@ -29,6 +29,7 @@ |
+ #include "flang/Optimizer/Dialect/Support/KindMapping.h" |
+ #include "flang/Optimizer/HLFIR/HLFIROps.h" |
+ #include "flang/Optimizer/OpenMP/Passes.h" |
++ #include "flang/Support/OpenMP-utils.h" |
+@@ -47,6 +48,7 @@ namespace flangomp { |
+ } // namespace flangomp |
+	 |
+ using namespace mlir; |
++ using namespace Fortran::common::openmp; |
+@@ -193,38 +195,5 @@ class MapsForPrivatizedSymbolsPass |
+	} |
+	} |
+	} |
+- // As the name suggests, this function examines var to determine if |
+- // it has dynamic size. If true, this pass'll have to extract these |
+- // bounds from descriptor of var and add the bounds to the resultant |
+- // MapInfoOp. |
+- bool needsBoundsOps(mlir::Value var) { |
+-  assert(mlir::isa<omp::PointerLikeType>(var.getType()) && |
+-  "needsBoundsOps can deal only with pointer types"); |
+-  mlir::Type t = fir::unwrapRefType(var.getType()); |
+-  // t could be a box, so look inside the box |
+- auto innerType = fir::dyn_cast_ptrOrBoxEleTy(t); |
+- if (innerType) |
+-  return fir::hasDynamicSize(innerType); |
+- return fir::hasDynamicSize(t); |
+- } |
+-  |
+- void genBoundsOps(fir::FirOpBuilder &builder, mlir::Value var, |
+-  llvm::SmallVector<mlir::Value> &boundsOps) { |
+-  mlir::Location loc = var.getLoc(); |
+-  fir::factory::AddrAndBoundsInfo info = |
+-  fir::factory::getDataOperandBaseAddr(builder, var, |
+-  /*isOptional=*/false, loc); |
+-  fir::ExtendedValue extendedValue = |
+-  hlfir::translateToExtendedValue(loc, builder, hlfir::Entity{info.addr}, |
+-  /*continguousHint=*/true) |
+-  .first; |
+-  llvm::SmallVector<mlir::Value> boundsOpsVec = |
+-  fir::factory::genImplicitBoundsOps<mlir::omp::MapBoundsOp, |
+-  mlir::omp::MapBoundsType>( |
+-  builder, info, extendedValue, |
+-  /*dataExvIsAssumedSize=*/false, loc); |
+-  for (auto bounds : boundsOpsVec) |
+-  boundsOps.push_back(bounds); |
+- } |
+ }; |
+ } // namespace |
+```
+- **Pipeline wiring:** `flang/lib/Optimizer/Passes/Pipelines.cpp` — add pass to the OpenMP FIR pipeline before `MapInfoFinalizationPass`.
+```diff
+@@ -316,13 +316,13 @@ void createOpenMPFIRPassPipeline(mlir::PassManager &pm, |
+	pm.addPass(flangomp::createDoConcurrentConversionPass( |
+	opts.doConcurrentMappingKind == DoConcurrentMappingKind::DCMK_Device)); |
+	 |
+- // The MapsForPrivatizedSymbols pass needs to run before |
+- // MapInfoFinalizationPass because the former creates new |
+- // MapInfoOp instances, typically for descriptors. |
+- // MapInfoFinalizationPass adds MapInfoOp instances for the descriptors |
+- // underlying data which is necessary to access the data on the offload |
+- // target device. |
++ // The MapsForPrivatizedSymbols and AutomapToTargetDataPass pass need to run |
++ // before MapInfoFinalizationPass because they create new MapInfoOp |
++ // instances, typically for descriptors. MapInfoFinalizationPass adds |
++ // MapInfoOp instances for the descriptors underlying data which is necessary |
++ // to access the data on the offload target device. |
+	pm.addPass(flangomp::createMapsForPrivatizedSymbolsPass()); |
++ pm.addPass(flangomp::createAutomapToTargetDataPass()); |
+	pm.addPass(flangomp::createMapInfoFinalizationPass()); |
+	pm.addPass(flangomp::createMarkDeclareTargetPass()); |
+	pm.addPass(flangomp::createGenericLoopConversionPass()); |
+```
+- **FIR transform test:** `flang/test/Transforms/omp-automap-to-target-data.fir` — validate the pass inserts `map.info`, `target_enter_data`, bounds ops, and `target_exit_data` around alloc/free.
+```diff
+@@ -0,0 +1,58 @@
++// RUN: fir-opt --omp-automap-to-target-data %s | FileCheck %s
++// Test OMP AutomapToTargetData pass.
++
++module {
++ fir.global
++ @_QMtestEarr{omp.declare_target = #omp.declaretarget<device_type = (any),
++ capture_clause = (enter), automap = true>} target
++ : !fir.box<!fir.heap<!fir.array<?xi32>>>
++
++ func.func @automap() {
++ %c0 = arith.constant 0 : index
++ %c10 = arith.constant 10 : i32
++ %addr = fir.address_of(@_QMtestEarr) : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
++ %decl:2 = hlfir.declare %addr {fortran_attrs = #fir.var_attrs<allocatable, target>, uniq_name = "_QMtestEarr"} : (!fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>) -> (!fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>, !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>)
++ %idx = fir.convert %c10 : (i32) -> index
++ %cond = arith.cmpi sgt, %idx, %c0 : index
++ %n = arith.select %cond, %idx, %c0 : index
++ %mem = fir.allocmem !fir.array<?xi32>, %n {fir.must_be_heap = true}
++ %shape = fir.shape %n : (index) -> !fir.shape<1>
++ %box = fir.embox %mem(%shape) : (!fir.heap<!fir.array<?xi32>>, !fir.shape<1>) -> !fir.box<!fir.heap<!fir.array<?xi32>>>
++ fir.store %box to %decl#0 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
++ %ld = fir.load %decl#0 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
++ %base = fir.box_addr %ld : (!fir.box<!fir.heap<!fir.array<?xi32>>>) -> !fir.heap<!fir.array<?xi32>>
++ fir.freemem %base : !fir.heap<!fir.array<?xi32>>
++ %undef = fir.zero_bits !fir.heap<!fir.array<?xi32>>
++ %sh0 = fir.shape %c0 : (index) -> !fir.shape<1>
++ %empty = fir.embox %undef(%sh0) : (!fir.heap<!fir.array<?xi32>>, !fir.shape<1>) -> !fir.box<!fir.heap<!fir.array<?xi32>>>
++ fir.store %empty to %decl#0 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
++ return
++ }
++ }
++
++// CHECK: fir.global @[[AUTOMAP:.*]] {{{.*}} automap = true
++// CHECK-LABEL: func.func @automap()
++// CHECK: %[[AUTOMAP_ADDR:.*]] = fir.address_of(@[[AUTOMAP]])
++// CHECK: %[[AUTOMAP_DECL:.*]]:2 = hlfir.declare %[[AUTOMAP_ADDR]]
++// CHECK: %[[ALLOC_MEM:.*]] = fir.allocmem
++// CHECK-NEXT: fir.shape
++// CHECK-NEXT: %[[ARR_BOXED:.*]] = fir.embox %[[ALLOC_MEM]]
++// CHECK-NEXT: fir.store %[[ARR_BOXED]]
++// CHECK-NEXT: %[[ARR_BOXED_LOADED:.*]] = fir.load %[[AUTOMAP_DECL]]#0
++// CHECK-NEXT: %[[ARR_HEAP_PTR:.*]] = fir.box_addr %[[ARR_BOXED_LOADED]]
++// CHECK-NEXT: %[[DIM0:.*]] = arith.constant 0 : index
++// CHECK-NEXT: %[[BOX_DIMS:.*]]:3 = fir.box_dims %[[ARR_BOXED_LOADED]], %[[DIM0]]
++// CHECK-NEXT: %[[ONE:.*]] = arith.constant 1 : index
++// CHECK-NEXT: %[[ZERO:.*]] = arith.constant 0 : index
++// CHECK-NEXT: %[[BOX_DIMS2:.*]]:3 = fir.box_dims %[[ARR_BOXED_LOADED]], %[[ZERO]]
++// CHECK-NEXT: %[[LOWER_BOUND:.*]] = arith.constant 0 : index
++// CHECK-NEXT: %[[UPPER_BOUND:.*]] = arith.subi %[[BOX_DIMS2]]#1, %[[ONE]] : index
++// CHECK-NEXT: omp.map.bounds lower_bound(%[[LOWER_BOUND]] : index) upper_bound(%[[UPPER_BOUND]] : index) extent(%[[BOX_DIMS2]]#1 : index) stride(%[[BOX_DIMS2]]#2 : index) start_idx(%[[BOX_DIMS]]#0 : index) {stride_in_bytes = true}
++// CHECK-NEXT: arith.muli %[[BOX_DIMS2]]#2, %[[BOX_DIMS2]]#1 : index
++// CHECK-NEXT: %[[MAP_INFO:.*]] = omp.map.info var_ptr(%[[AUTOMAP_DECL]]#0 {{.*}} map_clauses(to) capture(ByCopy)
++// CHECK-NEXT: omp.target_enter_data map_entries(%[[MAP_INFO]]
++// CHECK: %[[LOAD:.*]] = fir.load %[[AUTOMAP_DECL]]#0
++// CHECK: %[[EXIT_MAP:.*]] = omp.map.info var_ptr(%[[AUTOMAP_DECL]]#0 {{.*}} map_clauses(delete) capture(ByCopy)
++// CHECK-NEXT: omp.target_exit_data map_entries(%[[EXIT_MAP]]
++// CHECK-NEXT: %[[BOXADDR:.*]] = fir.box_addr %[[LOAD]]
++// CHECK-NEXT: fir.freemem %[[BOXADDR]]
+```
+- **Offload test:** `offload/test/offloading/fortran/declare-target-automap.f90` — validates runtime presence and mapping behavior with `declare target enter(automap: ...)`.
+```diff
+@@ -0,0 +36 @@
++!Offloading test for AUTOMAP modifier in declare target enter
++! REQUIRES: flang, amdgpu
++
++program automap_program
++ use iso_c_binding, only: c_loc
++ use omp_lib, only: omp_get_default_device, omp_target_is_present
++ integer, parameter :: N = 10
++ integer :: i
++ integer, allocatable, target :: automap_array(:)
++ !$omp declare target enter(automap:automap_array)
++
++ ! false since the storage is not present even though the descriptor is present
++ write (*, *) omp_target_is_present(c_loc(automap_array), omp_get_default_device())
++ ! CHECK: 0
++
++ allocate (automap_array(N))
++ ! true since the storage should be allocated and reference count incremented by the allocate
++ write (*, *) omp_target_is_present(c_loc(automap_array), omp_get_default_device())
++ ! CHECK: 1
++
++ ! since storage is present this should not be a runtime error
++ !$omp target teams loop
++ do i = 1, N
++   automap_array(i) = i
++ end do
++
++ !$omp target update from(automap_array)
++ write (*, *) automap_array
++ ! CHECK: 1 2 3 4 5 6 7 8 9 10
++
++ deallocate (automap_array)
++
++ ! automap_array should have it's storage unmapped on device here
++ write (*, *) omp_target_is_present(c_loc(automap_array), omp_get_default_device())
++ ! CHECK: 0
++end program
+```
+
+Pitfalls & Reviewer Notes
+- Bounds generation: Always compute and attach `omp.map.bounds` for dynamically-sized arrays; missing bounds lead to incorrect device extents.
+- Pipeline ordering: Run `AutomapToTargetDataPass` before `MapInfoFinalizationPass` to ensure newly created `MapInfoOp`s are finalized.
+- Device type: Skip host-only `declare target` entries; only automap variables with non-host device types are considered.
+- Capture kind: Use `ByCopy` for global descriptors; adjust as needed if semantics change for by-ref.
+
+Related Links
+- Files changed view: https://github.com/llvm/llvm-project/pull/153048/files
+
+How To Avoid Pitfalls
+- Use shared helpers in `OpenMP-utils.h` for bounds detection/emission; do not duplicate logic across passes.
+- Insert `target_enter_data` immediately after allocation and `target_exit_data` after deallocation to preserve lifetime semantics.
+- Keep mapper/device symbol attributes consistent on `map.info` to avoid mismatches during offload.
 
 ---
 
