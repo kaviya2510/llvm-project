@@ -99,6 +99,10 @@ void FunctionAttrPass::runOnOperation() {
     func->setAttr(
         mlir::LLVM::LLVMFuncOp::getPreferVectorWidthAttrName(llvmFuncOpName),
         mlir::StringAttr::get(context, preferVectorWidth));
+  if (UseSampleProfile)
+    func->setAttr(
+        mlir::LLVM::LLVMFuncOp::getUseSampleProfileAttrName(llvmFuncOpName),
+        mlir::BoolAttr::get(context, true));
 
   LLVM_DEBUG(llvm::dbgs() << "=== End " DEBUG_TYPE " ===\n");
 }
