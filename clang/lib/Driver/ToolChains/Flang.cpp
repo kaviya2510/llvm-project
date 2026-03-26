@@ -987,6 +987,9 @@ void Flang::ConstructJob(Compilation &C, const JobAction &JA,
   const Driver &D = TC.getDriver();
   ArgStringList CmdArgs;
 
+  bool IsCudaDevice = JA.isDeviceOffloading(Action::OFK_Cuda);
+  bool IsHIPDevice = JA.isDeviceOffloading(Action::OFK_HIP);
+
   // Invoke ourselves in -fc1 mode.
   CmdArgs.push_back("-fc1");
 
@@ -1099,6 +1102,26 @@ void Flang::ConstructJob(Compilation &C, const JobAction &JA,
   // recognise options: fprofile-generate -fprofile-use=
   Args.addAllArgs(
       CmdArgs, {options::OPT_fprofile_generate, options::OPT_fprofile_use_EQ});
+
+  if (!(IsCudaDevice || IsHIPDevice)) {
+    // recognise options: -fprofile-sample-use= and -fno-profile-sample-use=
+    if (Arg *A = getLastProfileSampleUseArg(Args)) {
+
+      auto *PGOArg = Args.getLastArg(options::OPT_fprofile_generate,
+                                     options::OPT_fprofile_generate_EQ);
+
+      if (PGOArg) {
+        D.Diag(diag::err_drv_argument_not_allowed_with)
+            << PGOArg->getAsString(Args) << A->getAsString(Args);
+      }
+
+      StringRef fname = A->getValue();
+      if (!llvm::sys::fs::exists(fname))
+        D.Diag(diag::err_drv_no_such_file) << fname;
+      else
+        A->render(Args, CmdArgs);
+    }
+  }
 
   // Forward flags for OpenMP. We don't do this if the current action is an
   // device offloading action other than OpenMP.
