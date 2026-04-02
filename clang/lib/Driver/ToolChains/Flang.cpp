@@ -1133,9 +1133,7 @@ void Flang::ConstructJob(Compilation &C, const JobAction &JA,
   Args.addAllArgs(
       CmdArgs, {options::OPT_fprofile_generate, options::OPT_fprofile_use_EQ});
 
-  if (!Triple.isNVPTX()) {
-    addPGOAndCoverageFlags(TC, JA, Args, CmdArgs);
-  }
+  addPGOAndCoverageFlags(TC, JA, Args, CmdArgs);
 
   // Forward flags for OpenMP. We don't do this if the current action is an
   // device offloading action other than OpenMP.
