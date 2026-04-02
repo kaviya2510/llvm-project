@@ -1,15 +1,15 @@
 ! Test to check the working of option "-fprofile-sample-use".
 
-! RUN: %flang -### %s 2>&1 | FileCheck %s --check-prefix=NO-PROFILE-SAMPLE-USE
-! RUN: %flang -### -fprofile-sample-use=%S/Inputs/pgo-sample.prof %s 2>&1 | FileCheck %s --check-prefix=PROFILE-SAMPLE-USE
-! RUN: %flang -### -fno-profile-sample-use %s 2>&1 | FileCheck %s --check-prefix=NO-PROFILE-SAMPLE-USE
+! RUN: %flang -### -target x86_64-unknown-linux %s 2>&1 | FileCheck %s --check-prefix=NO-PROFILE-SAMPLE-USE
+! RUN: %flang -### -target x86_64-unknown-linux -fprofile-sample-use=%S/Inputs/pgo-sample.prof %s 2>&1 | FileCheck %s --check-prefix=PROFILE-SAMPLE-USE
+! RUN: %flang -### -target x86_64-unknown-linux -fno-profile-sample-use %s 2>&1 | FileCheck %s --check-prefix=NO-PROFILE-SAMPLE-USE
 
-! RUN: %flang -### -fprofile-sample-use=%S/Inputs/pgo-sample.prof -fno-profile-sample-use %s 2>&1 | FileCheck %s --check-prefix=NO-PROFILE-SAMPLE-USE
+! RUN: %flang -### -target x86_64-unknown-linux -fprofile-sample-use=%S/Inputs/pgo-sample.prof -fno-profile-sample-use %s 2>&1 | FileCheck %s --check-prefix=NO-PROFILE-SAMPLE-USE
 
-! RUN: not %flang -fsyntax-only -fprofile-sample-use=%t/missing-profile.prof %s 2>&1 | FileCheck %s --check-prefix=PROFILE-SAMPLE-USE-NO-FILE
-! RUN: not %flang -fsyntax-only -fprofile-generate -fprofile-sample-use=%S/Inputs/pgo-sample.prof %s 2>&1 | FileCheck %s --check-prefix=PROFILE-SAMPLE-USE-ERROR
+! RUN: not %flang -target x86_64-unknown-linux -fsyntax-only -fprofile-sample-use=%t/missing-profile.prof %s 2>&1 | FileCheck %s --check-prefix=PROFILE-SAMPLE-USE-NO-FILE
+! RUN: not %flang -target x86_64-unknown-linux -fsyntax-only -fprofile-generate -fprofile-sample-use=%S/Inputs/pgo-sample.prof %s 2>&1 | FileCheck %s --check-prefix=PROFILE-SAMPLE-USE-ERROR
 
-! RUN: not %flang -target powerpc-ibm-aix -### -fprofile-sample-use=%S/Inputs/pgo-sample.prof %s 2>&1 \
+! RUN: not %flang -target powerpc64-ibm-aix -### -fprofile-sample-use=%S/Inputs/pgo-sample.prof %s 2>&1 \
 ! RUN:   | FileCheck %s --check-prefix=PROFILE-SAMPLE-USE-UNSUPPORTED-AIX
 
 ! NO-PROFILE-SAMPLE-USE-NOT: "-fprofile-sample-use"
@@ -18,7 +18,7 @@
 ! PROFILE-SAMPLE-USE-NO-FILE: error: no such file or directory: {{.*}}missing-profile.prof{{.*}}
 ! PROFILE-SAMPLE-USE-ERROR: error: invalid argument '-fprofile-generate' not allowed with '-fprofile-sample-use={{.*}}'
 
-! PROFILE-SAMPLE-USE-UNSUPPORTED-AIX: error: unsupported option '-fprofile-sample-use=' for target 'powerpc-ibm-aix'
+! PROFILE-SAMPLE-USE-UNSUPPORTED-AIX: error: unsupported option '-fprofile-sample-use=' for target 'powerpc64-ibm-aix'
 
 integer function hot(x)
    integer, intent(in) :: x
