@@ -141,16 +141,6 @@ bool ExternalFileUnit::OpenUnit(common::optional<OpenStatus> status,
     Close(CloseStatus::Keep, handler);
     impliedClose = true;
   }
-  if (newPath.get() && newPathLength > 0) {
-    if (const auto *already{
-            GetUnitMap(handler).LookUp(newPath.get(), newPathLength)}) {
-      handler.SignalError(IostatOpenAlreadyConnected,
-          "OPEN(UNIT=%d,FILE='%.*s'): file is already connected to unit %d",
-          unitNumber_, static_cast<int>(newPathLength), newPath.get(),
-          already->unitNumber_);
-      return impliedClose;
-    }
-  }
   set_path(std::move(newPath), newPathLength);
   Open(status.value_or(OpenStatus::Unknown), action, position, handler);
   if (handler.InError()) {
