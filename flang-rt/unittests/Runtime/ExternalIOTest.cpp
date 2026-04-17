@@ -1020,3 +1020,66 @@ TEST(ExternalIOTests, OpenNewExtant) {
   ASSERT_EQ(IONAME(EndIoStatement)(io), IostatOk)
       << "EndIoStatement() for CLOSE(DELETE)";
 }
+
+TEST(ExternalIOTests, OpenSameFileOnMultipleUnits) {
+  // OPEN(10,FILE=...,STATUS='REPLACE',ACTION='READWRITE'); WRITE; FLUSH;
+  // OPEN(11,FILE=...,STATUS='OLD',ACTION='READ'); READ — same path, two units.
+  static constexpr const char filename[]{"dupmultunits"};
+  (void)::remove(filename);
+
+  Cookie io{IONAME(BeginOpenUnit)(10, __FILE__, __LINE__)};
+  ASSERT_TRUE(IONAME(SetFile)(io, filename, std::strlen(filename)))
+      << "SetFile(dupmultunits)";
+  ASSERT_TRUE(IONAME(SetStatus)(io, "REPLACE", 7)) << "SetStatus(REPLACE)";
+  ASSERT_TRUE(IONAME(SetAction)(io, "READWRITE", 9)) << "SetAction(READWRITE)";
+  ASSERT_EQ(IONAME(EndIoStatement)(io), IostatOk)
+      << "EndIoStatement() for OPEN(unit 10)";
+
+  static constexpr std::string_view fmt{"(A)"};
+  static constexpr std::string_view data{"hello"};
+  io = IONAME(BeginExternalFormattedOutput)(
+      fmt.data(), fmt.length(), nullptr, 10, __FILE__, __LINE__);
+  ASSERT_TRUE(IONAME(OutputAscii)(io, data.data(), data.length()));
+  ASSERT_EQ(IONAME(EndIoStatement)(io), IostatOk)
+      << "EndIoStatement() for WRITE";
+
+  io = IONAME(BeginFlush)(10, __FILE__, __LINE__);
+  ASSERT_EQ(IONAME(EndIoStatement)(io), IostatOk)
+      << "EndIoStatement() for FLUSH";
+
+  io = IONAME(BeginOpenUnit)(11, __FILE__, __LINE__);
+  ASSERT_TRUE(IONAME(SetFile)(io, filename, std::strlen(filename)))
+      << "SetFile(dupmultunits) on second unit";
+  ASSERT_TRUE(IONAME(SetStatus)(io, "OLD", 3)) << "SetStatus(OLD)";
+  ASSERT_TRUE(IONAME(SetAction)(io, "READ", 4)) << "SetAction(READ)";
+  ASSERT_EQ(IONAME(EndIoStatement)(io), IostatOk)
+      << "EndIoStatement() for OPEN(unit 11, same FILE=)";
+
+  io = IONAME(BeginRewind)(11, __FILE__, __LINE__);
+  ASSERT_EQ(IONAME(EndIoStatement)(io), IostatOk)
+      << "EndIoStatement() for REWIND";
+
+  char line[20];
+  std::memset(line, 'X', sizeof line);
+  StaticDescriptor<0> staticDescriptor;
+  Descriptor &desc{staticDescriptor.descriptor()};
+  desc.Establish(TypeCode{CFI_type_char}, sizeof line, line, 0);
+  desc.Check();
+  io = IONAME(BeginExternalFormattedInput)(
+      fmt.data(), fmt.length(), nullptr, 11, __FILE__, __LINE__);
+  ASSERT_TRUE(IONAME(InputDescriptor)(io, desc));
+  ASSERT_EQ(IONAME(EndIoStatement)(io), IostatOk)
+      << "EndIoStatement() for READ";
+  ASSERT_EQ(std::memcmp(line, "hello", 5), 0);
+  for (std::size_t i{5}; i < sizeof line; ++i) {
+    ASSERT_EQ(line[i], ' ');
+  }
+
+  io = IONAME(BeginClose)(11, __FILE__, __LINE__);
+  ASSERT_EQ(IONAME(EndIoStatement)(io), IostatOk)
+      << "EndIoStatement() for CLOSE(11)";
+  io = IONAME(BeginClose)(10, __FILE__, __LINE__);
+  ASSERT_TRUE(IONAME(SetStatus)(io, "DELETE", 6)) << "SetStatus(DELETE)";
+  ASSERT_EQ(IONAME(EndIoStatement)(io), IostatOk)
+      << "EndIoStatement() for CLOSE(10,DELETE)";
+}
