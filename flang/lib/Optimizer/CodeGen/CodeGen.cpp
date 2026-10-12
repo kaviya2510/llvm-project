@@ -45,6 +45,7 @@
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/Conversion/MathToFuncs/MathToFuncs.h"
 #include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
+#include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
 #include "mlir/Conversion/MathToLibm/MathToLibm.h"
 #include "mlir/Conversion/MathToNVVM/MathToNVVM.h"
 #include "mlir/Conversion/MathToROCDL/MathToROCDL.h"
@@ -5056,6 +5057,12 @@ public:
       mlir::populateMathToLibmConversionPatterns(pattern);
     mlir::populateComplexToLLVMConversionPatterns(typeConverter, pattern);
     mlir::index::populateIndexToLLVMConversionPatterns(typeConverter, pattern);
+    // MemRef ops only appear if the FIR-to-MemRef lowering ran. They must be
+    // converted in the same pass as fir.convert, which is what produces the
+    // memref values, otherwise the two conversions leave an unresolvable cast
+    // at their boundary.
+    mlir::populateFinalizeMemRefToLLVMConversionPatterns(typeConverter,
+                                                         pattern);
     mlir::populateVectorToLLVMConversionPatterns(typeConverter, pattern);
     mlir::ub::populateUBToLLVMConversionPatterns(typeConverter, pattern);
 

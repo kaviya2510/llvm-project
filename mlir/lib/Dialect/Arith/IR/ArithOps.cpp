@@ -2405,9 +2405,80 @@ OpFoldResult arith::IndexCastOp::fold(FoldAdaptor adaptor) {
   return {};
 }
 
+namespace {
+/// index_cast(trunci nsw(%x)) -> index_cast(%x)
+///
+/// The nsw flag promises the truncated bits all match the sign bit of the
+/// result, so the narrowing preserves the signed value and the intermediate
+/// width is irrelevant to the subsequent cast.
+struct IndexCastOfTruncINSW final : OpRewritePattern<arith::IndexCastOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(arith::IndexCastOp op,
+                                PatternRewriter &rewriter) const override {
+    auto trunc = op.getIn().getDefiningOp<arith::TruncIOp>();
+    if (!trunc || !bitEnumContainsAll(trunc.getOverflowFlags(),
+                                      arith::IntegerOverflowFlags::nsw))
+      return failure();
+    rewriter.replaceOpWithNewOp<arith::IndexCastOp>(op, op.getType(),
+                                                    trunc.getIn());
+    return success();
+  }
+};
+
+/// Sink an index_cast through nsw integer arithmetic so that the arithmetic is
+/// performed in index type:
+///
+///   index_cast(addi nsw(%a, %b)) -> addi(index_cast(%a), index_cast(%b))
+///
+/// This is only sound because of the nsw flag: index has an unspecified width,
+/// so when index is wider than the operand type the cast sign-extends and the
+/// rewrite would otherwise lose the wraparound. nsw rules the wraparound out.
+///
+/// Only applied when an operand is itself an index_cast from index, or a
+/// constant, so that the rewrite strictly removes casts rather than adding
+/// them. Combined with the existing index_cast(index_cast(%i)) -> %i fold this
+/// collapses index -> intN -> index round-trips into pure index arithmetic.
+template <typename BinOp>
+struct IndexCastOfNSWBinOp final : OpRewritePattern<arith::IndexCastOp> {
+  using OpRewritePattern<arith::IndexCastOp>::OpRewritePattern;
+
+  /// An operand is profitable to re-materialize in index type if doing so
+  /// cancels a cast or folds into a constant.
+  static bool isProfitableOperand(Value v, Type indexTy) {
+    if (auto cast = v.getDefiningOp<arith::IndexCastOp>())
+      return cast.getIn().getType() == indexTy;
+    return matchPattern(v, m_Constant());
+  }
+
+  LogicalResult matchAndRewrite(arith::IndexCastOp op,
+                                PatternRewriter &rewriter) const override {
+    auto bin = op.getIn().getDefiningOp<BinOp>();
+    if (!bin || !bitEnumContainsAll(bin.getOverflowFlags(),
+                                    arith::IntegerOverflowFlags::nsw))
+      return failure();
+
+    Type resTy = op.getType();
+    if (!isProfitableOperand(bin.getLhs(), resTy) &&
+        !isProfitableOperand(bin.getRhs(), resTy))
+      return failure();
+
+    Value lhs = arith::IndexCastOp::create(rewriter, op.getLoc(), resTy,
+                                           bin.getLhs());
+    Value rhs = arith::IndexCastOp::create(rewriter, op.getLoc(), resTy,
+                                           bin.getRhs());
+    rewriter.replaceOpWithNewOp<BinOp>(op, lhs, rhs);
+    return success();
+  }
+};
+} // namespace
+
 void arith::IndexCastOp::getCanonicalizationPatterns(
     RewritePatternSet &patterns, MLIRContext *context) {
-  patterns.add<IndexCastOfExtSI>(context);
+  patterns.add<IndexCastOfExtSI, IndexCastOfTruncINSW,
+               IndexCastOfNSWBinOp<arith::AddIOp>,
+               IndexCastOfNSWBinOp<arith::SubIOp>,
+               IndexCastOfNSWBinOp<arith::MulIOp>>(context);
 }
 
 //===----------------------------------------------------------------------===//

@@ -208,6 +208,26 @@ def MemRefDataFlowOpt : Pass<"fir-memref-dataflow-opt", "::mlir::func::FuncOp"> 
   ];
 }
 
+def FIRConvertToArith : Pass<"fir-convert-to-arith"> {
+  let summary = "Rewrite integer/index fir.convert ops as arith casts";
+  let description = [{
+    Rewrite `fir.convert` ops whose source and result are both integer or
+    index types into the equivalent `arith` cast (`arith.index_cast`,
+    `arith.extsi` or `arith.trunci`).
+
+    `fir.convert` is opaque to the generic MLIR canonicalizers, so a subscript
+    that round-trips through `index -> iN -> index` cannot be folded back to
+    pure index arithmetic while the casts are spelled as `fir.convert`. Using
+    the `arith` equivalents lets the arith canonicalization patterns collapse
+    the round-trip, which in turn lets `affine-raise-from-memref` recognise the
+    subscript as affine.
+
+    Only signless integer and index types are rewritten; i1 and unsigned
+    sources are left alone because they zero-extend rather than sign-extend.
+  }];
+  let dependentDialects = ["mlir::arith::ArithDialect"];
+}
+
 def FIRToMemRef : Pass<"fir-to-memref", "::mlir::func::FuncOp"> {
   let summary = "Convert FIR memory operations to MemRef dialect";
   let description = [{

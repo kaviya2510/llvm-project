@@ -21,6 +21,7 @@
 #include "flang/Optimizer/OpenACC/Support/RegisterOpenACCExtensions.h"
 #include "flang/Optimizer/OpenMP/Support/RegisterOpenMPExtensions.h"
 #include "mlir/Conversion/Passes.h"
+#include "mlir/Dialect/MemRef/Transforms/Passes.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/Transforms/Passes.h"
 #include "mlir/Dialect/Complex/IR/Complex.h"
@@ -130,6 +131,26 @@ inline void registerMLIRPassesForFortranTools() {
 
   mlir::registerMem2RegPass();
   mlir::registerLowerAffinePass();
+  // Expose SCF->Affine raising so fir-opt can experiment with the
+  // fir.do_loop -> fir-to-scf -> raise-scf-to-affine path.
+  mlir::registerRaiseSCFToAffinePass();
+  // Raise memref.load/store -> affine.load/store and fold reinterpret_cast
+  // so the fir-to-memref -> raise path yields fully affine memory accesses.
+  mlir::affine::registerRaiseMemrefDialect();
+  mlir::affine::registerAffineFoldMemRefAliasOpsPass();
+  // Needed to take the affine/memref form all the way to the LLVM dialect:
+  // reinterpret_cast and friends must be expanded before memref descriptors
+  // can be converted.
+  mlir::memref::registerExpandStridedMetadataPass();
+  mlir::registerFinalizeMemRefToLLVMConversionPass();
+
+  // Generic cleanup/motion passes exposed for Fortran tooling (e.g. fir-opt)
+  // and experimentation. These are not part of the default compilation
+  // pipeline; FIR ops already implement the interfaces these rely on
+  // (RegionBranchOpInterface / ConditionallySpeculatable / MemoryEffects).
+  mlir::registerControlFlowSinkPass();
+  mlir::registerRemoveDeadValuesPass();
+  mlir::registerTrivialDeadCodeEliminationPass();
 }
 
 /// Register the interfaces needed to lower to LLVM IR.
