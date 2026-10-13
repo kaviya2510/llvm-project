@@ -143,6 +143,10 @@ inline void registerMLIRPassesForFortranTools() {
   // can be converted.
   mlir::memref::registerExpandStridedMetadataPass();
   mlir::registerFinalizeMemRefToLLVMConversionPass();
+  // affine-super-vectorize emits vector.transfer ops, which need these two to
+  // reach the LLVM dialect.
+  mlir::registerConvertVectorToSCFPass();
+  mlir::registerConvertVectorToLLVMPass();
 
   // Generic cleanup/motion passes exposed for Fortran tooling (e.g. fir-opt)
   // and experimentation. These are not part of the default compilation

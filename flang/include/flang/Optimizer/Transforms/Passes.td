@@ -228,6 +228,35 @@ def FIRConvertToArith : Pass<"fir-convert-to-arith"> {
   let dependentDialects = ["mlir::arith::ArithDialect"];
 }
 
+def SimplifyDoLoop : Pass<"simplify-fir-loop", "::mlir::func::FuncOp"> {
+  let summary = "Forward a DO loop's induction variable past its memory slot";
+  let description = [{
+    A Fortran DO statement names a variable, so lowering spills the loop's
+    induction variable into that variable's storage on every iteration and
+    reloads it wherever the body refers to it. This pass replaces those reloads
+    with the induction variable and removes the spill.
+
+    Removing the spill matters for two reasons. It is a write to a scalar slot
+    in the middle of the loop, which stops `affine-super-vectorize` from
+    vectorizing the body. It also sits between the loads of any variable used as
+    an inner loop bound, and since the slot cannot be proven distinct from that
+    variable the redundant load cannot be forwarded; the inner bound then stays
+    a value loaded inside the loop, which is not an affine symbol, so
+    `raise-scf-to-affine` leaves the inner loop as `scf.for`.
+
+    Once the reloads are gone the variable may have no readers left, in which
+    case the store describing the value it holds after the loop is removed too.
+    For an inner loop that store sits in the enclosing loop's body, so dropping
+    it is what leaves a perfectly nested loop nest for `affine-loop-tile` and
+    `affine-loop-coalescing` to work on.
+
+    A spill is only removed when it is the sole write to the slot the loop can
+    reach, every read of the slot inside the loop is dominated by it, and the
+    slot's address does not escape. Stores are only removed from a slot that
+    nothing reads.
+  }];
+}
+
 def FIRToMemRef : Pass<"fir-to-memref", "::mlir::func::FuncOp"> {
   let summary = "Convert FIR memory operations to MemRef dialect";
   let description = [{

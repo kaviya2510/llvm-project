@@ -45,10 +45,10 @@
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/Conversion/MathToFuncs/MathToFuncs.h"
 #include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
-#include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
 #include "mlir/Conversion/MathToLibm/MathToLibm.h"
 #include "mlir/Conversion/MathToNVVM/MathToNVVM.h"
 #include "mlir/Conversion/MathToROCDL/MathToROCDL.h"
+#include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
 #include "mlir/Conversion/OpenMPToLLVM/ConvertOpenMPToLLVM.h"
 #include "mlir/Conversion/UBToLLVM/UBToLLVM.h"
 #include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVM.h"
@@ -61,6 +61,8 @@
 #include "mlir/Dialect/LLVMIR/Transforms/AddComdats.h"
 #include "mlir/Dialect/OpenACC/OpenACC.h"
 #include "mlir/Dialect/OpenMP/OpenMPDialect.h"
+#include "mlir/Dialect/Vector/Transforms/LoweringPatterns.h"
+#include "mlir/Dialect/Vector/Transforms/VectorRewritePatterns.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/TypeUtilities.h"
@@ -68,6 +70,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Target/LLVMIR/Import.h"
 #include "mlir/Target/LLVMIR/ModuleTranslation.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/TypeSwitch.h"
@@ -5040,6 +5043,22 @@ public:
     }
 
     auto *context = getModule().getContext();
+
+    // vector.transfer ops, which affine-super-vectorize produces, have no
+    // direct LLVM conversion; they are first reduced to vector.load/store and
+    // an explicit mask. ConvertVectorToLLVMPass does this as a pre-step before
+    // its own conversion, and the conversion below has to do the same because
+    // it is where the memref these ops address is converted.
+    {
+      mlir::RewritePatternSet patterns(context);
+      mlir::vector::populateVectorTransferLoweringPatterns(
+          patterns, /*maxTransferRank=*/1);
+      mlir::vector::populateVectorMaskMaterializationPatterns(
+          patterns, /*force32BitVectorIndices=*/false);
+      if (mlir::failed(mlir::applyPatternsGreedily(mod, std::move(patterns))))
+        return signalPassFailure();
+    }
+
     fir::LLVMTypeConverter typeConverter{getModule(),
                                          options.applyTBAA || applyTBAA,
                                          options.forceUnifiedTBAATree, *dl};

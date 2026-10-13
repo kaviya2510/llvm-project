@@ -34,6 +34,7 @@ add_flang_library(FIRTransforms
   FIRToSCF.cpp
   FIRToMemRef.cpp
   FIRConvertToArith.cpp
+  SimplifyDoLoop.cpp
   MemoryUtils.cpp
   MemoryAllocation.cpp
   StackArrays.cpp
